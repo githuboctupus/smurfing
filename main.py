@@ -811,4 +811,4 @@ def end():
     # print(f"Game {data['game']['id']} ended.")
     return jsonify({"status": "ok"})
 
-app.run(host="0.0.0.0", port=8080, debug=False)
+app.run(host="0.0.0.0", port=8000, debug=False)
