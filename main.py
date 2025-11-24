@@ -2,7 +2,7 @@ import json
 import math
 import random
 import copy
-from collections import deque
+from collections import deque, defaultdict
 
 from flask import Flask, request, jsonify
 
@@ -14,14 +14,14 @@ I_DEFAULT = 500    # number of simulations per turn
 D_DEFAULT = 10     # max depth per simulation
 
 # Risk-averse root scoring blend (mean vs worst)
-ALPHA_SAFE = 0.75     # when we're comfortable, lean more on mean
-ALPHA_DANGER = 0.35   # when in danger, lean more on worst-case
+ALPHA_SAFE = 0.8      # when we're comfortable, lean on mean more
+ALPHA_DANGER = 0.45   # when in danger, still pessimistic but not paralyzed
 
-# How to handle unvisited DecisionNodes at root
+# Unvisited DecisionNodes handling at root
 USE_ONE_STEP_FALLBACK_FOR_UNVISITED = True
 
-# Head-to-head kill penalty scaling (when enemy wins)
-BASE_HEAD_KILL_PENALTY = 5e7
+# Head-to-head kill penalty baseline
+BASE_HEAD_KILL_PENALTY = 3e7
 
 # Random seed (None = fully random)
 r0 = None
@@ -104,7 +104,7 @@ def is_alive(s, idx):
     return 0 <= idx < len(s["sn"]) and s["sn"][idx]["alive"]
 
 # =========================
-# Occupancy & safe moves (tail-aware)
+# Tail-aware occupancy & safe moves
 # =========================
 
 def compute_occupied_for_collision(s):
@@ -280,95 +280,152 @@ def step_state_inplace(s, moves):
         s["f"] = [f for f in food if f not in eaten_food]
 
 # =========================
-# Flood-fill: territory + local space
+# Decaying-body flood fill
 # =========================
+
+def compute_walkable_at(s):
+    """
+    Return map (x,y) -> earliest time step when tile becomes walkable,
+    using dynamic tail decay (your suggested logic).
+    """
+    sn = s["sn"]
+    w, h = s["w"], s["h"]
+
+    walkable_at = {}
+
+    # default: empty tiles walkable at time 0
+    for x in range(w):
+        for y in range(h):
+            walkable_at[(x, y)] = 0
+
+    # overwrite body tiles with actual times
+    for snake in sn:
+        if not snake["alive"]:
+            continue
+
+        body = snake["b"]
+        L = len(body)
+        if L == 0:
+            continue
+
+        # head: blocked forever
+        hx, hy = body[0]
+        walkable_at[(hx, hy)] = math.inf
+
+        # inner segments open when tail eventually reaches them
+        # index k from head: opens at (L - 1 - k)
+        for k in range(1, L - 1):
+            x, y = body[k]
+            walkable_at[(x, y)] = (L - 1) - k
+
+        # tail becomes free next turn
+        if L > 1:
+            tx, ty = body[-1]
+            walkable_at[(tx, ty)] = 1
+
+    return walkable_at
 
 def compute_areas(s):
     """
-    Multi-source BFS territory:
-      my_area, max_enemy_area
+    Dynamic territory floodfill with progressive tail-decay.
+    Uses your decaying-body BFS to get (my_area, max_enemy_area).
     """
-    w, h = s["w"], s["h"]
-    snakes = s["sn"]
+    sn = s["sn"]
     yi = s["yi"]
-    my_id = yi
+    w, h = s["w"], s["h"]
+    dirs = list(DELTA.values())
 
-    occ = compute_occupied_for_collision(s)
+    walkable_at = compute_walkable_at(s)
 
-    dist = [[math.inf] * w for _ in range(h)]
-    owner = [[-1] * w for _ in range(h)]
+    dist = {}                # (x,y) -> earliest distance
+    claimants = defaultdict(set)
+    frontier = []
 
-    q = deque()
-    lengths = [len(sn["b"]) for sn in snakes]
-
-    for idx, sn in enumerate(snakes):
-        if not sn["alive"]:
+    # Multi-source init from all heads
+    for i, snake in enumerate(sn):
+        if not snake["alive"]:
             continue
-        if not sn["b"]:
+        body = snake["b"]
+        if not body:
             continue
-        hx, hy = sn["b"][0]
-        if not in_bounds(hx, hy, w, h):
+        hx, hy = body[0]
+        dist[(hx, hy)] = 0
+        claimants[(hx, hy)].add(i)
+        frontier.append((hx, hy, i))
+
+    d = 0
+
+    # BFS with dynamic walkability
+    while frontier:
+        next_frontier = []
+
+        for (x, y, idx) in frontier:
+            for dx, dy in dirs:
+                nx, ny = x + dx, y + dy
+
+                if not in_bounds(nx, ny, w, h):
+                    continue
+
+                if d + 1 < walkable_at[(nx, ny)]:
+                    continue
+
+                if (nx, ny) not in dist:
+                    dist[(nx, ny)] = d + 1
+                    claimants[(nx, ny)].add(idx)
+                    next_frontier.append((nx, ny, idx))
+                elif dist[(nx, ny)] == d + 1:
+                    claimants[(nx, ny)].add(idx)
+
+        if not next_frontier:
+            break
+
+        frontier = next_frontier
+        d += 1
+
+    lengths = {i: len(a["b"]) for i, a in enumerate(sn)}
+    area_count = defaultdict(int)
+
+    for cell, idxs in claimants.items():
+        if len(idxs) == 1:
+            area_count[next(iter(idxs))] += 1
             continue
-        if (hx, hy) in occ:
-            continue
-        dist[hy][hx] = 0
-        owner[hy][hx] = idx
-        q.append((hx, hy, idx))
 
-    while q:
-        x, y, idx = q.popleft()
-        d0 = dist[y][x]
-        for dx, dy in DELTA.values():
-            nx, ny = x + dx, y + dy
-            if not in_bounds(nx, ny, w, h):
-                continue
-            if (nx, ny) in occ:
-                continue
-            nd = d0 + 1
-            if nd < dist[ny][nx]:
-                dist[ny][nx] = nd
-                owner[ny][nx] = idx
-                q.append((nx, ny, idx))
-            elif nd == dist[ny][nx] and owner[ny][nx] != idx:
-                current_owner = owner[ny][nx]
-                if current_owner == -1:
-                    owner[ny][nx] = idx
-                else:
-                    if lengths[idx] > lengths[current_owner]:
-                        owner[ny][nx] = idx
+        mx = max(lengths[i] for i in idxs)
+        best = [i for i in idxs if lengths[i] == mx]
 
-    area_counts = [0] * len(snakes)
-    for y in range(h):
-        for x in range(w):
-            o = owner[y][x]
-            if o >= 0:
-                area_counts[o] += 1
+        if len(best) == 1:
+            area_count[best[0]] += 1
+        # ties of equal length: contested, ignored
 
-    my_area = area_counts[my_id] if 0 <= my_id < len(area_counts) else 0
-    enemy_areas = [area_counts[i] for i in range(len(area_counts)) if i != my_id]
-    max_enemy_area = max(enemy_areas) if enemy_areas else 0
+    my_area = area_count.get(yi, 0)
+
+    max_enemy_area = 0
+    for i, snake in enumerate(sn):
+        if i != yi and snake["alive"]:
+            max_enemy_area = max(max_enemy_area, area_count.get(i, 0))
 
     return my_area, max_enemy_area
 
 def compute_local_space(s, idx, max_steps=30):
     """
-    Single-snake flood-fill from our head:
-      how many cells locally reachable without hitting bodies/walls
+    Local decaying-body floodfill from our head:
+    how many tiles we can reach before time max_steps.
+    This is what keeps us out of sticky self-trap situations.
     """
     w, h = s["w"], s["h"]
-    snakes = s["sn"]
-    me = snakes[idx]
+    sn = s["sn"]
+    me = sn[idx]
     head = me["b"][0]
 
-    occ = compute_occupied_for_collision(s)
+    walkable_at = compute_walkable_at(s)
 
     visited = set([head])
     q = deque([(head[0], head[1], 0)])
-    count = 0
+    reachable = 0
 
     while q:
         x, y, d = q.popleft()
-        count += 1
+        reachable += 1
         if d >= max_steps:
             continue
         for dx, dy in DELTA.values():
@@ -377,11 +434,11 @@ def compute_local_space(s, idx, max_steps=30):
                 continue
             if (nx, ny) in visited:
                 continue
-            if (nx, ny) in occ:
+            if d + 1 < walkable_at[(nx, ny)]:
                 continue
             visited.add((nx, ny))
             q.append((nx, ny, d + 1))
-    return count
+    return reachable
 
 # =========================
 # Evaluation
@@ -394,9 +451,11 @@ def evaluate_state(s):
     Principles:
       - Never die.
       - Always value food (growth = threat).
-      - Shorter -> more food-seeking & shy.
-      - Longer -> more aggressive & space-controlling.
-      - Flood fill baked in (territory + local space).
+      - Shorter -> more food/health driven, shy about head-to-head.
+      - Longer -> still values food but leans more on space/control & kill pressure.
+      - Flood fill:
+          * global territory via decaying-body BFS
+          * local reachable area via decaying-body BFS
     """
     yi = s["yi"]
     snakes = s["sn"]
@@ -419,11 +478,11 @@ def evaluate_state(s):
     max_enemy_len = max(enemy_lengths) if enemy_lengths else 0
     length_diff = my_len - max_enemy_len  # >0: we're longer
 
-    # Territory flood-fill
+    # Territory & local space (both decaying-body based)
     my_area, max_enemy_area = compute_areas(s)
     local_space = compute_local_space(s, yi)
 
-    # Food: always valuable, but especially if short or low HP
+    # Food: always valuable
     food_bonus = 0.0
     nearest_food_dist = None
     for fx, fy in s["f"]:
@@ -431,35 +490,34 @@ def evaluate_state(s):
         if nearest_food_dist is None or d < nearest_food_dist:
             nearest_food_dist = d
         if d == 0:
-            food_bonus += 10.0
+            food_bonus += 12.0
         elif d <= 8:
-            food_bonus += (9 - d)
+            food_bonus += (10 - d)
 
-    # Base weights
-    space_weight = 0.22
-    control_weight = 0.12
-    local_space_weight = 1.0   # strong: avoid self-traps
+    # Base weights before personality adjustments
+    space_weight = 0.18
+    control_weight = 0.1
+    local_space_weight = 0.7  # still important, but not dominating
 
-    # Food & health weights vary with HP and length_diff
-    # Shorter -> more food/health; longer -> slightly less food weight, more territory/space
     if my_hp <= 35:
-        base_health_w = 0.08
-        base_food_w = 0.65
+        base_health_w = 0.09
+        base_food_w = 0.8
     else:
         base_health_w = 0.05
-        base_food_w = 0.35
+        base_food_w = 0.5
 
+    # Personality by relative length
     if length_diff <= -3:
-        # We're significantly shorter: be very food/health-focused
-        health_weight = base_health_w * 1.2
-        food_weight = base_food_w * 1.3
+        # Significantly shorter → eat & stay open
+        health_weight = base_health_w * 1.3
+        food_weight = base_food_w * 1.4
         local_space_weight *= 1.1
-        space_weight *= 0.8
-        control_weight *= 0.8
+        space_weight *= 0.7
+        control_weight *= 0.7
     elif length_diff >= 3:
-        # We're significantly longer: more aggressive, care about space/control too
+        # Significantly longer → still value food, but more on space/control
         health_weight = base_health_w * 0.9
-        food_weight = base_food_w * 0.9  # still positive, but less desperate
+        food_weight = base_food_w * 0.85
         local_space_weight *= 1.0
         space_weight *= 1.3
         control_weight *= 1.3
@@ -467,38 +525,38 @@ def evaluate_state(s):
         health_weight = base_health_w
         food_weight = base_food_w
 
-    # Length gain since root (growth = more threat)
+    # Length gain since root (growth = threat)
     init_len = s.get("init_len", my_len)
     length_gain = my_len - init_len
     if length_diff <= -2:
-        length_gain_weight = 0.32
+        length_gain_weight = 0.35
     elif length_diff >= 2:
         length_gain_weight = 0.22
     else:
-        length_gain_weight = 0.27
+        length_gain_weight = 0.28
 
-    # Starvation / unreachable food risk: if low HP and food is far
+    # Starvation / unreachable food
     starvation_penalty = 0.0
     if my_hp <= 25:
         if not s["f"]:
-            starvation_penalty -= 70.0
+            starvation_penalty -= 80.0
         elif nearest_food_dist is not None and nearest_food_dist > 8:
-            starvation_penalty -= 40.0
+            starvation_penalty -= 50.0
 
-    # Current-head adjacency danger vs bigger/equal heads
-    head_danger_penalty = 0.0
+    # Current adjacency head danger/opportunity
+    head_danger_term = 0.0
     for i, sn in enumerate(snakes):
         if i == yi or not sn["alive"]:
             continue
         other_head = sn["b"][0]
         other_len = len(sn["b"])
-        if manhattan(my_head, other_head) == 1:
+        d = manhattan(my_head, other_head)
+        if d == 1:
             if other_len >= my_len + 1:
-                # Bigger: strong penalty
-                head_danger_penalty -= 40.0
+                head_danger_term -= 45.0
             elif my_len >= other_len + 2:
-                # We are clearly bigger; small incentive to pressure
-                head_danger_penalty += 8.0
+                # bigger → mild reward for pressure
+                head_danger_term += 10.0
 
     space_term = space_weight * my_area
     control_term = control_weight * (my_area - max_enemy_area)
@@ -514,7 +572,7 @@ def evaluate_state(s):
         food_term +
         length_term +
         starvation_penalty +
-        head_danger_penalty +
+        head_danger_term +
         local_space_term
     )
     return score
@@ -572,9 +630,17 @@ def ucb_score(node, parent_visits, c=1.4):
     return mean + c * math.sqrt(math.log(parent_visits + 1e-9) / node["n"])
 
 def simulate_once(root, max_depth=D_DEFAULT):
+    """
+    One MCTS rollout:
+      - selection
+      - expansion
+      - simulation
+      - backprop using evaluate_state
+    """
     path = []
     node = root
     depth = 0
+    v = None
 
     while True:
         path.append(node)
@@ -634,8 +700,7 @@ def simulate_once(root, max_depth=D_DEFAULT):
                 depth += 1
                 continue
 
-    v = evaluate_state(node["state"]) if "v" not in locals() else v
-
+    # v computed at leaf / terminal
     for n in path:
         n["n"] += 1
         n["sum_v"] += v
@@ -648,9 +713,7 @@ def simulate_once(root, max_depth=D_DEFAULT):
 
 def danger_level(s):
     """
-    Decide risk profile:
-      - 'danger' when low HP or clearly shorter.
-      - 'safe' otherwise.
+    Decide risk profile based on HP and relative size.
     """
     yi = s["yi"]
     snakes = s["sn"]
@@ -713,7 +776,7 @@ def fallback_value_for_unvisited(root_state, dnode, siblings, use_one_step=True)
         return v
 
 # =========================
-# Root: enemy head kill zones
+# Root enemy head kill zones
 # =========================
 
 def compute_enemy_head_kill_zones(s):
@@ -729,7 +792,10 @@ def compute_enemy_head_kill_zones(s):
     for i, sn in enumerate(snakes):
         if not sn["alive"] or i == yi:
             continue
-        hx, hy = sn["b"][0]
+        body = sn["b"]
+        if not body:
+            continue
+        hx, hy = body[0]
         enemy_len = len(sn["b"])
         sm = safe_moves(s, i)
         if not sm:
@@ -778,9 +844,8 @@ def choose_move_minimax_tree_from_json(
 
     kill_map = compute_enemy_head_kill_zones(s0)
 
-    # We scale head-kill penalty by how much shorter we are:
-    enemy_lengths = [v for v in kill_map.values()]
-    max_enemy_len_here = max(enemy_lengths) if enemy_lengths else 0
+    enemy_lengths_here = [v for v in kill_map.values()]
+    max_enemy_len_here = max(enemy_lengths_here) if enemy_lengths_here else 0
     length_diff_global = my_len - max_enemy_len_here
 
     for mv, dnode in root["children"].items():
@@ -797,13 +862,10 @@ def choose_move_minimax_tree_from_json(
 
         if enemy_len_here > 0:
             if enemy_len_here >= my_len + 1:
-                # They win head-to-head in this square: huge penalty
-                # If we're much shorter, be even more shy
                 penalty_scale = 1.5 if length_diff_global <= -3 else 1.0
                 score -= BASE_HEAD_KILL_PENALTY * penalty_scale
             elif my_len >= enemy_len_here + 2:
-                # We clearly win head-to-head here; small aggressive reward
-                score += 500.0
+                score += 800.0  # encourage kill squares we win
 
         move_scores[mv] = score
 
@@ -872,4 +934,6 @@ def move():
 def end():
     data = request.get_json()
     return jsonify({"status": "ok"})
-app.run(host="0.0.0.0", port=8000, debug=False)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080, debug=False)
