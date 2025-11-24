@@ -4,28 +4,29 @@ import random
 import copy
 from collections import deque
 
-# Flask imports for hosting Battlesnake
 from flask import Flask, request, jsonify
 
-# Global search parameters (tune for speed/strength)
+# =========================
+# Global config
+# =========================
+
 I_DEFAULT = 500    # number of simulations per turn
-D_DEFAULT = 6     # maximum depth of a single simulation
+D_DEFAULT = 10     # max depth per simulation
 
-# Risk-averse root scoring
-# alpha ~ 0.3 = very risk averse, ~0.6 = more opportunistic
-ALPHA_SAFE = 0.6
-ALPHA_DANGER = 0.3
+# Risk-averse root scoring blend (mean vs worst)
+ALPHA_SAFE = 0.75     # when we're comfortable, lean more on mean
+ALPHA_DANGER = 0.35   # when in danger, lean more on worst-case
 
-# How to handle unvisited DecisionNodes at root:
-# True  -> do a one-step simulation (my move + random enemies) to get a value
-# False -> set a prior based on visited siblings' values
+# How to handle unvisited DecisionNodes at root
 USE_ONE_STEP_FALLBACK_FOR_UNVISITED = True
 
-# Random seed (set to None for fully random behavior)
+# Head-to-head kill penalty scaling (when enemy wins)
+BASE_HEAD_KILL_PENALTY = 5e7
+
+# Random seed (None = fully random)
 r0 = None
 if r0 is not None:
     random.seed(r0)
-
 
 DIRS = ["up", "down", "left", "right"]
 DELTA = {
@@ -35,6 +36,10 @@ DELTA = {
     "right": (1, 0),
 }
 
+# =========================
+# Basic helpers
+# =========================
+
 def in_bounds(x, y, w, h):
     return 0 <= x < w and 0 <= y < h
 
@@ -42,10 +47,7 @@ def manhattan(a, b):
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 def is_stacked_body(body):
-    """
-    Returns True if the snake body has duplicate coordinates,
-    which means it's "stacked" and its tail will NOT move this turn.
-    """
+    """True if body has duplicate coords (stacked, tail won't move)."""
     seen = set()
     for x, y in body:
         if (x, y) in seen:
@@ -53,28 +55,11 @@ def is_stacked_body(body):
         seen.add((x, y))
     return False
 
+# =========================
+# State conversion
+# =========================
 
 def s_from_json(j):
-    """
-    Convert Battlesnake JSON game state into internal state dict.
-
-    Internal state format:
-      s = {
-        "w": width,
-        "h": height,
-        "sn": [
-          {
-            "id": snake_id (str),
-            "b": [(x_head, y_head), ..., (x_tail, y_tail)],
-            "hp": health (int),
-            "alive": bool,
-          }, ...
-        ],
-        "yi": index of our snake in sn,
-        "f": [(fx, fy), ...],  # food positions
-        "init_len": initial length of our snake at root
-      }
-    """
     board = j["board"]
     you_id = j["you"]["id"]
 
@@ -88,7 +73,7 @@ def s_from_json(j):
         snake_id = s_json["id"]
         body = [(seg["x"], seg["y"]) for seg in s_json["body"]]
         hp = s_json["health"]
-        alive = True  # JSON only provides living snakes here
+        alive = True
 
         snake = {
             "id": snake_id,
@@ -97,7 +82,6 @@ def s_from_json(j):
             "alive": alive,
         }
         snakes.append(snake)
-
         if snake_id == you_id:
             yi = idx
 
@@ -114,22 +98,21 @@ def s_from_json(j):
     return s
 
 def state_copy(s):
-    """Deep copy of state dict."""
     return copy.deepcopy(s)
 
 def is_alive(s, idx):
-    """Return True if snake idx is alive."""
     return 0 <= idx < len(s["sn"]) and s["sn"][idx]["alive"]
 
+# =========================
+# Occupancy & safe moves (tail-aware)
+# =========================
 
 def compute_occupied_for_collision(s):
     """
-    Compute occupied cells for body-collision purposes.
-
-    Rule:
+    Occupied cells for body collisions:
       - All body segments except tails are blocked.
-      - Tail of a NON-stacked snake is considered vacating, so not blocked.
-      - Tail of a stacked snake stays put, so is blocked.
+      - Tail of NON-stacked snake is vacating -> free.
+      - Tail of stacked snake stays -> blocked.
     """
     occ = set()
     for snake in s["sn"]:
@@ -140,20 +123,16 @@ def compute_occupied_for_collision(s):
             continue
         tail = body[-1]
         stacked = is_stacked_body(body)
-        # Add all body segments except tail
         for seg in body[:-1]:
             occ.add(seg)
-        # Tail is blocked only if stacked
         if stacked:
             occ.add(tail)
     return occ
 
 def safe_moves(s, idx):
     """
-    Return list of safe moves for snake idx, based on:
-      - Board bounds
-      - Not colliding with bodies (with tail-vacate logic)
-    Head-to-head risk is handled in evaluation, not here.
+    Moves that don't immediately die by body/wall collision.
+    Head-to-head risk is evaluated separately.
     """
     snake = s["sn"][idx]
     if not snake["alive"]:
@@ -161,46 +140,35 @@ def safe_moves(s, idx):
 
     w, h = s["w"], s["h"]
     head_x, head_y = snake["b"][0]
-
-    # Occupied cells for body collisions
     occ = compute_occupied_for_collision(s)
 
-    safe = []
+    out = []
     for mv in DIRS:
         dx, dy = DELTA[mv]
         nx, ny = head_x + dx, head_y + dy
         if not in_bounds(nx, ny, w, h):
             continue
-        # If this is our own tail, and we are NOT stacked, treat it as free.
+
         if (nx, ny) in occ:
-            # Check special case: our own tail and non-stacked
             body = snake["b"]
             if len(body) > 0 and (nx, ny) == body[-1] and not is_stacked_body(body):
-                # allowed – tail vacates
-                safe.append(mv)
+                out.append(mv)  # own tail vacates
             else:
-                # blocked
                 continue
         else:
-            safe.append(mv)
-    return safe
+            out.append(mv)
+    return out
 
+# =========================
+# Step function
+# =========================
 
 def step_state_inplace(s, moves):
-    """
-    Advance the game state by one full turn:
-      - moves: dict snake_id -> "up"/"down"/"left"/"right"
-      - updates positions, food, and alive flags in-place.
-
-    This is an approximate but reasonably faithful implementation
-    of Battlesnake rules for standard play.
-    """
     w, h = s["w"], s["h"]
     snakes = s["sn"]
     food = s["f"]
     food_set = set(food)
 
-    # 1) Compute tentative new heads and whether each snake will eat
     new_heads = {}
     will_eat = {}
     for snake in snakes:
@@ -213,14 +181,13 @@ def step_state_inplace(s, moves):
             continue
 
         head_x, head_y = body[0]
-        mv = moves.get(sid, "up")  # default if missing, shouldn't happen
+        mv = moves.get(sid, "up")
         dx, dy = DELTA[mv]
         nx, ny = head_x + dx, head_y + dy
 
         new_heads[sid] = (nx, ny)
         will_eat[sid] = (nx, ny) in food_set
 
-    # 2) Build tentative new bodies (before collision resolution)
     new_bodies = {}
     for snake in snakes:
         if not snake["alive"]:
@@ -234,54 +201,43 @@ def step_state_inplace(s, moves):
         eat = will_eat[sid]
 
         if eat:
-            # Grow: add new head, keep tail
             new_body = [(nx, ny)] + body
         else:
-            # Normal move: add new head, drop tail
             new_body = [(nx, ny)] + body[:-1]
         new_bodies[sid] = new_body
 
-    # 3) Out-of-bounds and self/body collisions
-    # First, compute all body cells (excluding heads) for collision checks
     body_cells = set()
     for snake in snakes:
         if not snake["alive"]:
             continue
-        sid = snake["id"]
-        nb = new_bodies.get(sid)
+        nb = new_bodies.get(snake["id"])
         if not nb:
             continue
         for (x, y) in nb[1:]:
             body_cells.add((x, y))
 
-    # Mark snakes dead for wall or body collision
     for snake in snakes:
         if not snake["alive"]:
             continue
-        sid = snake["id"]
-        nb = new_bodies.get(sid)
+        nb = new_bodies.get(snake["id"])
         if not nb:
             snake["alive"] = False
             continue
         hx, hy = nb[0]
 
-        # Wall collision
         if not in_bounds(hx, hy, w, h):
             snake["alive"] = False
             continue
 
-        # Body collision (into any body cell, including its own)
         if (hx, hy) in body_cells:
             snake["alive"] = False
             continue
 
-    # 4) Head-to-head collisions
     heads_map = {}
     for snake in snakes:
         if not snake["alive"]:
             continue
-        sid = snake["id"]
-        nb = new_bodies.get(sid)
+        nb = new_bodies.get(snake["id"])
         if not nb:
             snake["alive"] = False
             continue
@@ -291,20 +247,16 @@ def step_state_inplace(s, moves):
     for pos, snakes_here in heads_map.items():
         if len(snakes_here) <= 1:
             continue
-        # Multiple heads in same cell: kill shorter ones; if tie, all die
         max_len = max(len(s["b"]) for s in snakes_here)
         longest = [s for s in snakes_here if len(s["b"]) == max_len]
         if len(longest) == 1:
-            # All others die
             for s2 in snakes_here:
                 if s2 is not longest[0]:
                     s2["alive"] = False
         else:
-            # All die on equal length tie
             for s2 in snakes_here:
                 s2["alive"] = False
 
-    # 5) Apply new bodies, update health, remove eaten food
     eaten_food = set()
     for snake in snakes:
         if not snake["alive"]:
@@ -315,10 +267,7 @@ def step_state_inplace(s, moves):
             snake["alive"] = False
             continue
 
-        # Update body
         snake["b"] = nb
-
-        # Health
         snake["hp"] -= 1
         if will_eat.get(sid, False):
             snake["hp"] = 100
@@ -327,37 +276,28 @@ def step_state_inplace(s, moves):
         if snake["hp"] <= 0:
             snake["alive"] = False
 
-    # Remove eaten food
     if eaten_food:
         s["f"] = [f for f in food if f not in eaten_food]
 
+# =========================
+# Flood-fill: territory + local space
+# =========================
 
 def compute_areas(s):
     """
-    Compute (my_area, max_enemy_area) via multi-source BFS.
-
-    Approximation:
-      - Bodies (with stacked-tail logic) are treated as walls.
-      - We flood-fill from all heads simultaneously.
-      - Each cell is "owned" by the snake that can reach it earliest.
-      - Ties are broken by length (longer snake wins).
-
-    Returns:
-      my_area:         number of cells owned by our snake
-      max_enemy_area:  maximum area owned by any single enemy
+    Multi-source BFS territory:
+      my_area, max_enemy_area
     """
     w, h = s["w"], s["h"]
     snakes = s["sn"]
     yi = s["yi"]
     my_id = yi
 
-    # Occupied as per body collisions
     occ = compute_occupied_for_collision(s)
 
     dist = [[math.inf] * w for _ in range(h)]
     owner = [[-1] * w for _ in range(h)]
 
-    # Initial queue: all alive snake heads
     q = deque()
     lengths = [len(sn["b"]) for sn in snakes]
 
@@ -375,7 +315,6 @@ def compute_areas(s):
         owner[hy][hx] = idx
         q.append((hx, hy, idx))
 
-    # BFS
     while q:
         x, y, idx = q.popleft()
         d0 = dist[y][x]
@@ -391,7 +330,6 @@ def compute_areas(s):
                 owner[ny][nx] = idx
                 q.append((nx, ny, idx))
             elif nd == dist[ny][nx] and owner[ny][nx] != idx:
-                # Tie: break by length (longer snake wins)
                 current_owner = owner[ny][nx]
                 if current_owner == -1:
                     owner[ny][nx] = idx
@@ -412,31 +350,63 @@ def compute_areas(s):
 
     return my_area, max_enemy_area
 
+def compute_local_space(s, idx, max_steps=30):
+    """
+    Single-snake flood-fill from our head:
+      how many cells locally reachable without hitting bodies/walls
+    """
+    w, h = s["w"], s["h"]
+    snakes = s["sn"]
+    me = snakes[idx]
+    head = me["b"][0]
+
+    occ = compute_occupied_for_collision(s)
+
+    visited = set([head])
+    q = deque([(head[0], head[1], 0)])
+    count = 0
+
+    while q:
+        x, y, d = q.popleft()
+        count += 1
+        if d >= max_steps:
+            continue
+        for dx, dy in DELTA.values():
+            nx, ny = x + dx, y + dy
+            if not in_bounds(nx, ny, w, h):
+                continue
+            if (nx, ny) in visited:
+                continue
+            if (nx, ny) in occ:
+                continue
+            visited.add((nx, ny))
+            q.append((nx, ny, d + 1))
+    return count
+
+# =========================
+# Evaluation
+# =========================
 
 def evaluate_state(s):
     """
-    Scalar evaluation of the state from our perspective.
+    Scalar eval, from our point of view.
 
-    Priorities:
-      1. Death  -> huge negative
-      2. Win    -> huge positive
-      3. Avoid starvation / low HP
-      4. Get food when low
-      5. Prefer safe head positioning (avoid adjacency to bigger heads)
-      6. Then maximize territory / control
+    Principles:
+      - Never die.
+      - Always value food (growth = threat).
+      - Shorter -> more food-seeking & shy.
+      - Longer -> more aggressive & space-controlling.
+      - Flood fill baked in (territory + local space).
     """
     yi = s["yi"]
     snakes = s["sn"]
     me = snakes[yi]
 
-    # If we're dead, huge negative
     if not me["alive"]:
         return -1e9
 
-    # Count alive snakes
     alive_indices = [i for i, sn in enumerate(snakes) if sn["alive"]]
     if len(alive_indices) == 1 and alive_indices[0] == yi:
-        # Only us alive -> huge positive (win)
         return 1e8
 
     my_body = me["b"]
@@ -444,56 +414,98 @@ def evaluate_state(s):
     my_hp = me["hp"]
     my_head = my_body[0]
 
-    # Territory
-    my_area, max_enemy_area = compute_areas(s)
+    # Length relations
+    enemy_lengths = [len(sn["b"]) for i, sn in enumerate(snakes) if sn["alive"] and i != yi]
+    max_enemy_len = max(enemy_lengths) if enemy_lengths else 0
+    length_diff = my_len - max_enemy_len  # >0: we're longer
 
-    # Food bonus (stronger when low HP)
+    # Territory flood-fill
+    my_area, max_enemy_area = compute_areas(s)
+    local_space = compute_local_space(s, yi)
+
+    # Food: always valuable, but especially if short or low HP
     food_bonus = 0.0
+    nearest_food_dist = None
     for fx, fy in s["f"]:
         d = manhattan(my_head, (fx, fy))
+        if nearest_food_dist is None or d < nearest_food_dist:
+            nearest_food_dist = d
         if d == 0:
-            food_bonus += 6.0
-        elif d <= 6:
-            food_bonus += (6 - d)
+            food_bonus += 10.0
+        elif d <= 8:
+            food_bonus += (9 - d)
 
-    # HP weight: stronger when low
-    if my_hp <= 40:
-        health_weight = 0.06
-        food_weight = 0.35
+    # Base weights
+    space_weight = 0.22
+    control_weight = 0.12
+    local_space_weight = 1.0   # strong: avoid self-traps
+
+    # Food & health weights vary with HP and length_diff
+    # Shorter -> more food/health; longer -> slightly less food weight, more territory/space
+    if my_hp <= 35:
+        base_health_w = 0.08
+        base_food_w = 0.65
     else:
-        health_weight = 0.03
-        food_weight = 0.12
+        base_health_w = 0.05
+        base_food_w = 0.35
 
-    # Length gain since root
+    if length_diff <= -3:
+        # We're significantly shorter: be very food/health-focused
+        health_weight = base_health_w * 1.2
+        food_weight = base_food_w * 1.3
+        local_space_weight *= 1.1
+        space_weight *= 0.8
+        control_weight *= 0.8
+    elif length_diff >= 3:
+        # We're significantly longer: more aggressive, care about space/control too
+        health_weight = base_health_w * 0.9
+        food_weight = base_food_w * 0.9  # still positive, but less desperate
+        local_space_weight *= 1.0
+        space_weight *= 1.3
+        control_weight *= 1.3
+    else:
+        health_weight = base_health_w
+        food_weight = base_food_w
+
+    # Length gain since root (growth = more threat)
     init_len = s.get("init_len", my_len)
     length_gain = my_len - init_len
-    effective_len_weight = 0.25 if my_hp <= 40 else 0.15
+    if length_diff <= -2:
+        length_gain_weight = 0.32
+    elif length_diff >= 2:
+        length_gain_weight = 0.22
+    else:
+        length_gain_weight = 0.27
 
-    # Simple starvation risk: if HP is very low and no food -> penalty
+    # Starvation / unreachable food risk: if low HP and food is far
     starvation_penalty = 0.0
     if my_hp <= 25:
         if not s["f"]:
+            starvation_penalty -= 70.0
+        elif nearest_food_dist is not None and nearest_food_dist > 8:
             starvation_penalty -= 40.0
 
-    # Head danger: adjacency to bigger/equal heads
+    # Current-head adjacency danger vs bigger/equal heads
     head_danger_penalty = 0.0
     for i, sn in enumerate(snakes):
         if i == yi or not sn["alive"]:
             continue
         other_head = sn["b"][0]
         other_len = len(sn["b"])
-        if manhattan(my_head, other_head) == 1 and other_len >= my_len:
-            head_danger_penalty -= 25.0
-
-    # Territory weights
-    space_weight = 0.5
-    control_weight = 0.25
+        if manhattan(my_head, other_head) == 1:
+            if other_len >= my_len + 1:
+                # Bigger: strong penalty
+                head_danger_penalty -= 40.0
+            elif my_len >= other_len + 2:
+                # We are clearly bigger; small incentive to pressure
+                head_danger_penalty += 8.0
 
     space_term = space_weight * my_area
     control_term = control_weight * (my_area - max_enemy_area)
     health_term = health_weight * my_hp
     food_term = food_weight * food_bonus
-    length_term = effective_len_weight * length_gain
+    length_term = length_gain_weight * length_gain
+    local_space_term = local_space_weight * local_space
 
     score = (
         space_term +
@@ -502,17 +514,16 @@ def evaluate_state(s):
         food_term +
         length_term +
         starvation_penalty +
-        head_danger_penalty
+        head_danger_penalty +
+        local_space_term
     )
     return score
 
+# =========================
+# Enemy model
+# =========================
 
 def random_enemy_moves(s, my_idx):
-    """
-    For each enemy snake, pick a random safe move if possible.
-    If no safe move exists, pick any direction (may die).
-    Returns: dict snake_id -> move
-    """
     snakes = s["sn"]
     moves = {}
     for i, sn in enumerate(snakes):
@@ -529,15 +540,18 @@ def random_enemy_moves(s, my_idx):
         moves[sid] = mv
     return moves
 
+# =========================
+# Tree structures & MCTS
+# =========================
 
 def make_game_node(state):
     return {
         "type": "game",
         "state": state,
-        "children": {},      # move (str) -> DecisionNode
-        "n": 0,              # visit count
-        "sum_v": 0.0,        # sum of values
-        "min_v": float("inf") # worst value seen
+        "children": {},
+        "n": 0,
+        "sum_v": 0.0,
+        "min_v": float("inf")
     }
 
 def make_decision_node(move, parent_game_node):
@@ -545,23 +559,19 @@ def make_decision_node(move, parent_game_node):
         "type": "decision",
         "move": move,
         "parent": parent_game_node,
-        "children": [],             # list of GameNodes (samples for this move)
+        "children": [],
         "n": 0,
         "sum_v": 0.0,
         "min_v": float("inf"),
     }
 
 def ucb_score(node, parent_visits, c=1.4):
-    """Upper Confidence Bound for tree selection."""
     if node["n"] == 0:
         return float("inf")
     mean = node["sum_v"] / node["n"]
     return mean + c * math.sqrt(math.log(parent_visits + 1e-9) / node["n"])
 
 def simulate_once(root, max_depth=D_DEFAULT):
-    """
-    Run one simulation from root using MCTS-style selection.
-    """
     path = []
     node = root
     depth = 0
@@ -573,7 +583,6 @@ def simulate_once(root, max_depth=D_DEFAULT):
             s = node["state"]
             yi = s["yi"]
 
-            # Terminal or depth limit reached
             if not is_alive(s, yi):
                 v = evaluate_state(s)
                 break
@@ -585,7 +594,6 @@ def simulate_once(root, max_depth=D_DEFAULT):
                 v = evaluate_state(s)
                 break
 
-            # Expand GameNode if necessary
             my_idx = yi
             my_moves = safe_moves(s, my_idx)
             if not my_moves:
@@ -596,7 +604,6 @@ def simulate_once(root, max_depth=D_DEFAULT):
                 for mv in my_moves:
                     node["children"][mv] = make_decision_node(mv, node)
 
-            # Select a DecisionNode child via UCB
             parent_visits = node["n"] if node["n"] > 0 else 1
             children = list(node["children"].values())
             chosen = max(children, key=lambda cn: ucb_score(cn, parent_visits))
@@ -604,7 +611,6 @@ def simulate_once(root, max_depth=D_DEFAULT):
             continue
 
         else:
-            # DecisionNode: our move is fixed, enemies are random
             parent_game = node["parent"]
             base_state = parent_game["state"]
             my_idx = base_state["yi"]
@@ -628,50 +634,49 @@ def simulate_once(root, max_depth=D_DEFAULT):
                 depth += 1
                 continue
 
-    # Backpropagate v along the path
+    v = evaluate_state(node["state"]) if "v" not in locals() else v
+
     for n in path:
         n["n"] += 1
         n["sum_v"] += v
         if v < n["min_v"]:
             n["min_v"] = v
 
+# =========================
+# Risk profile + root fallback
+# =========================
 
 def danger_level(s):
-    """Heuristic danger detection."""
+    """
+    Decide risk profile:
+      - 'danger' when low HP or clearly shorter.
+      - 'safe' otherwise.
+    """
     yi = s["yi"]
     snakes = s["sn"]
     me = snakes[yi]
     my_len = len(me["b"])
     my_hp = me["hp"]
 
+    enemy_lengths = [len(sn["b"]) for i, sn in enumerate(snakes) if sn["alive"] and i != yi]
+    max_enemy_len = max(enemy_lengths) if enemy_lengths else 0
+    length_diff = my_len - max_enemy_len
+
     if my_hp <= 30:
         return "danger"
-
-    for i, sn in enumerate(snakes):
-        if i == yi or not sn["alive"]:
-            continue
-        if len(sn["b"]) >= my_len + 3:
-            return "danger"
-
+    if length_diff <= -3:
+        return "danger"
     return "safe"
 
 def risk_averse_score(dnode, mode="safe"):
-    """Score a DecisionNode based on mean and worst values."""
     if dnode["n"] == 0:
         return 0.0
-
     mean_v = dnode["sum_v"] / dnode["n"]
     worst_v = dnode["min_v"] if dnode["min_v"] != float("inf") else mean_v
-
-    if mode == "danger":
-        alpha = ALPHA_DANGER
-    else:
-        alpha = ALPHA_SAFE
-
+    alpha = ALPHA_DANGER if mode == "danger" else ALPHA_SAFE
     return alpha * mean_v + (1.0 - alpha) * worst_v
 
 def fallback_value_for_unvisited(root_state, dnode, siblings, use_one_step=True):
-    """Compute a value for an unvisited root DecisionNode."""
     mv = dnode["move"]
 
     if use_one_step:
@@ -707,6 +712,42 @@ def fallback_value_for_unvisited(root_state, dnode, siblings, use_one_step=True)
         dnode["min_v"] = v
         return v
 
+# =========================
+# Root: enemy head kill zones
+# =========================
+
+def compute_enemy_head_kill_zones(s):
+    """
+    Squares enemy heads can occupy next turn:
+      (x,y) -> max enemy length that can hit that square.
+    """
+    yi = s["yi"]
+    snakes = s["sn"]
+    w, h = s["w"], s["h"]
+
+    kill_map = {}
+    for i, sn in enumerate(snakes):
+        if not sn["alive"] or i == yi:
+            continue
+        hx, hy = sn["b"][0]
+        enemy_len = len(sn["b"])
+        sm = safe_moves(s, i)
+        if not sm:
+            continue
+        for mv in sm:
+            dx, dy = DELTA[mv]
+            nx, ny = hx + dx, hy + dy
+            if not in_bounds(nx, ny, w, h):
+                continue
+            prev = kill_map.get((nx, ny), 0)
+            if enemy_len > prev:
+                kill_map[(nx, ny)] = enemy_len
+    return kill_map
+
+# =========================
+# Main move choice
+# =========================
+
 def choose_move_minimax_tree_from_json(
     j,
     I=I_DEFAULT,
@@ -714,17 +755,18 @@ def choose_move_minimax_tree_from_json(
     use_one_step_fallback=USE_ONE_STEP_FALLBACK_FOR_UNVISITED,
     debug=False,
 ):
-    """Main entry: given Battlesnake JSON 'j', choose our move."""
     s0 = s_from_json(j)
     root = make_game_node(state_copy(s0))
 
-    # Run simulations
     for _ in range(I):
         simulate_once(root, max_depth=max_depth)
 
-    # No children -> just pick any safe move or 'up'
+    yi = s0["yi"]
+    my_snake = s0["sn"][yi]
+    my_len = len(my_snake["b"])
+    my_head_x, my_head_y = my_snake["b"][0]
+
     if not root["children"]:
-        yi = s0["yi"]
         my_moves = safe_moves(s0, yi)
         if not my_moves:
             return "up"
@@ -734,6 +776,13 @@ def choose_move_minimax_tree_from_json(
     move_scores = {}
     dnodes = list(root["children"].values())
 
+    kill_map = compute_enemy_head_kill_zones(s0)
+
+    # We scale head-kill penalty by how much shorter we are:
+    enemy_lengths = [v for v in kill_map.values()]
+    max_enemy_len_here = max(enemy_lengths) if enemy_lengths else 0
+    length_diff_global = my_len - max_enemy_len_here
+
     for mv, dnode in root["children"].items():
         if dnode["n"] == 0:
             siblings = [sib for sib in dnodes if sib is not dnode]
@@ -741,6 +790,21 @@ def choose_move_minimax_tree_from_json(
             score = risk_averse_score(dnode, mode=mode)
         else:
             score = risk_averse_score(dnode, mode=mode)
+
+        dx, dy = DELTA[mv]
+        nx, ny = my_head_x + dx, my_head_y + dy
+        enemy_len_here = kill_map.get((nx, ny), 0)
+
+        if enemy_len_here > 0:
+            if enemy_len_here >= my_len + 1:
+                # They win head-to-head in this square: huge penalty
+                # If we're much shorter, be even more shy
+                penalty_scale = 1.5 if length_diff_global <= -3 else 1.0
+                score -= BASE_HEAD_KILL_PENALTY * penalty_scale
+            elif my_len >= enemy_len_here + 2:
+                # We clearly win head-to-head here; small aggressive reward
+                score += 500.0
+
         move_scores[mv] = score
 
     best_move = max(move_scores.items(), key=lambda kv: kv[1])[0]
@@ -752,7 +816,6 @@ def choose_move_minimax_tree_from_json(
 
     return best_move
 
-
 def handle_move_request(
     request_body,
     I=I_DEFAULT,
@@ -760,7 +823,6 @@ def handle_move_request(
     use_one_step_fallback=USE_ONE_STEP_FALLBACK_FOR_UNVISITED,
     debug=False,
 ):
-    """Adapter for Battlesnake /move endpoint."""
     mv = choose_move_minimax_tree_from_json(
         request_body,
         I=I,
@@ -773,42 +835,41 @@ def handle_move_request(
         "shout": f"tree: {mv}",
     }
 
-
-# -----------------------------
-# Flask server wiring
-# -----------------------------
+# =========================
+# Flask wiring
+# =========================
 
 app = Flask(__name__)
 
 @app.get("/")
 def index():
-    # Optional health/info endpoint
-    return jsonify({"apiversion": "1", "author": "geeked", "color": "#00FFAA", "head": "default", "tail": "default"})
-
+    return jsonify({
+        "apiversion": "1",
+        "author": "geeked",
+        "color": "#00FFAA",
+        "head": "default",
+        "tail": "default"
+    })
 
 @app.post("/start")
 def start():
-    # You can log or adjust global parameters based on game setup here if you want
     data = request.get_json()
-    # Example: print game id and board size
-    # print(f"Game {data['game']['id']} started on {data['board']['width']}x{data['board']['height']}")
     return jsonify({"taunt": "glhf"})
-
 
 @app.post("/move")
 def move():
     data = request.get_json()
-    move_resp = handle_move_request(data, I=I_DEFAULT, max_depth=D_DEFAULT,
-                                    use_one_step_fallback=USE_ONE_STEP_FALLBACK_FOR_UNVISITED,
-                                    debug=False)
+    move_resp = handle_move_request(
+        data,
+        I=I_DEFAULT,
+        max_depth=D_DEFAULT,
+        use_one_step_fallback=USE_ONE_STEP_FALLBACK_FOR_UNVISITED,
+        debug=False,
+    )
     return jsonify(move_resp)
-
 
 @app.post("/end")
 def end():
     data = request.get_json()
-    # Example: print result or cleanup; nothing required for logic
-    # print(f"Game {data['game']['id']} ended.")
     return jsonify({"status": "ok"})
-
 app.run(host="0.0.0.0", port=8000, debug=False)
