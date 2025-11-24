@@ -4,7 +4,7 @@ import copy
 from collections import deque
 
 # Global search parameters (tune for speed/strength)
-I_DEFAULT = 500   # number of simulations per turn
+I_DEFAULT = 700   # number of simulations per turn
 D_DEFAULT = 8    # maximum depth of a single simulation
 
 # Random seed (set to None for fully random behavior)
@@ -417,8 +417,8 @@ def evaluate_state(s):
     # ---------- 4) Combine terms ----------
     space_weight   = 1.0
     control_weight = 0.5
-    health_weight  = 0.01
-    food_weight    = 0.1
+    health_weight  = 0.05
+    food_weight    = 0.2
 
     control_term = my_area - max_enemy_area
     score  = 0.0
