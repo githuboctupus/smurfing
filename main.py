@@ -510,8 +510,7 @@ def choose_move_minimax_tree_from_json(j, I=I_DEFAULT, max_depth=D_DEFAULT, debu
 
 
 def battlesnake_move_response_minimax_tree(j_str, I=I_DEFAULT, max_depth=D_DEFAULT):
-    j = json.loads(j_str)
-    mv = choose_move_minimax_tree_from_json(j, I=I, max_depth=max_depth)
+    mv = choose_move_minimax_tree_from_json(j_str, I=I, max_depth=max_depth)
     return {
         "move": mv,
         "shout": f"",
