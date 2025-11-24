@@ -466,7 +466,7 @@ def choose_move_from_json(j, i_cnt=None, d_depth=None, debug=False):
 
     # bucketed death probability (don't-die objective)
     alpha = 1.0
-    bucket_size = 0.05  # changed from 0.1
+    bucket_size = 0.05  # your updated value
 
     danger_bucket = {}
     for a0 in root_moves:
@@ -478,17 +478,32 @@ def choose_move_from_json(j, i_cnt=None, d_depth=None, debug=False):
     mb = min(danger_bucket[a0] for a0 in root_moves)
     safe_set = [a0 for a0 in root_moves if danger_bucket[a0] == mb]
 
-    # ---- food bias inside the safest bucket ----
-    # score = win_rate + food_bias * avg_food
-    food_bias = 0.1  # per your request
+    # ---- PESSIMISTIC scoring inside the safest bucket ----
+    # Base score: win_rate + food_bias * avg_food
+    # Pessimism: subtract a penalty based on death_fraction,
+    #            but only once it exceeds a small threshold.
+    food_bias = 0.1
+    risk_threshold = 0.10   # <=10% "terrible scenarios" is tolerated
+    risk_scale = 40.0       # how hard we punish beyond the threshold
+
     scores = {}
 
     for a0 in safe_set:
+        # survivals for this move
         surv = max(1, i_cnt - deaths[a0])
         win_rate = wins[a0] / surv
-        # average food score over survivals (earlier food already weighted in fe)
-        avg_food = food_sum[a0] / surv
-        scores[a0] = win_rate + food_bias * avg_food
+        avg_food = food_sum[a0] / surv  # avg early-weighted food over survivals
+
+        # how many sims are "terrible" = deaths / total sims
+        death_fraction = deaths[a0] / i_cnt
+
+        # pessimistic penalty: nothing if small, grows once over threshold
+        if death_fraction > risk_threshold:
+            penalty = risk_scale * (death_fraction - risk_threshold)
+        else:
+            penalty = 0.0
+
+        scores[a0] = win_rate + food_bias * avg_food - penalty
 
     # If any move is a "guaranteed win" (wins == survivals), restrict to those
     gw = []
@@ -502,7 +517,7 @@ def choose_move_from_json(j, i_cnt=None, d_depth=None, debug=False):
     else:
         candidate_set = safe_set
 
-    # among candidates, pick the move with best (win + food) score
+    # among candidates, pick the move with best pessimistic score
     best_score = None
     best_moves = []
     for a0 in candidate_set:
@@ -516,23 +531,27 @@ def choose_move_from_json(j, i_cnt=None, d_depth=None, debug=False):
     mv = random.choice(best_moves)
 
     if debug:
-        print("\n=== DEBUG SCORES ===")
+        print("\n=== DEBUG SCORES (PESSIMISTIC) ===")
         print(f"iterations: {i_cnt}, depth: {d_depth}, food_bias: {food_bias}")
         print(f"{'move':<8}{'deaths':<8}{'bucket':<8}{'wins':<8}"
-              f"{'win_rate':<12}{'food_avg':<10}{'score':<10}")
-        print("-" * 80)
+              f"{'death_fr':<10}{'win_rate':<12}{'food_avg':<10}{'penalty':<10}{'score':<10}")
+        print("-" * 110)
         for a0 in root_moves:
             surv = max(1, i_cnt - deaths[a0])
-            wr = wins[a0] / surv
-            fa = food_sum[a0] / surv
+            win_rate = wins[a0] / surv
+            fa = food_sum[a0] / surv if surv > 0 else 0.0
+            death_fraction = deaths[a0] / i_cnt
+            if death_fraction > risk_threshold:
+                penalty = risk_scale * (death_fraction - risk_threshold)
+            else:
+                penalty = 0.0
             sc = scores.get(a0, float('-inf')) if a0 in safe_set else float('-inf')
             print(f"{a0:<8}{deaths[a0]:<8}{danger_bucket[a0]:<8}{wins[a0]:<8}"
-                  f"{wr:<12.4f}{fa:<10.4f}{sc:<10.4f}")
+                  f"{death_fraction:<10.3f}{win_rate:<12.4f}{fa:<10.4f}{penalty:<10.4f}{sc:<10.4f}")
         print("chosen move:", mv)
         print("====================\n")
 
     return mv
-
 
 def battlesnake_move_response(j_str, i_cnt=None, d_depth=None):
     j = json.loads(j_str)
