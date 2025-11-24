@@ -464,51 +464,65 @@ def choose_move_from_json(j, i_cnt=None, d_depth=None, debug=False):
         b = int(p / bucket_size)
         danger_bucket[a0] = b
 
-    # step 1: safest bucket
+    # step 1: safest bucket only
     mb = min(danger_bucket[a0] for a0 in root_moves)
     safe_set = [a0 for a0 in root_moves if danger_bucket[a0] == mb]
 
-    # step 2: within safest bucket, maximize raw wins
-    max_win_count = max(wins[a0] for a0 in safe_set)
-    win_moves = [a0 for a0 in safe_set if wins[a0] == max_win_count]
+    # ---- NEW: mix in a small food bias inside the safest bucket ----
+    # score = win_rate + food_bias * avg_food
+    # keep the don't-die objective first (buckets), then use this score.
+    food_bias = 0.1  # tweak this: 0.05 = very small, 0.2 = more hungry
+    scores = {}
 
-    # step 3: if any move is "guaranteed win" (wins == all survivals), prefer those
+    for a0 in safe_set:
+        surv = max(1, i_cnt - deaths[a0])
+        win_rate = wins[a0] / surv
+        avg_food = food_sum[a0] / i_cnt
+        scores[a0] = win_rate + food_bias * avg_food
+
+    # If any move is a "guaranteed win" (wins == survivals), restrict to those
     gw = []
-    for a0 in win_moves:
+    for a0 in safe_set:
         surv = i_cnt - deaths[a0]
         if surv > 0 and wins[a0] == surv:
             gw.append(a0)
+
     if gw:
-        cand = gw
+        candidate_set = gw
     else:
-        cand = win_moves
+        candidate_set = safe_set
 
-    # step 4: among candidates, maximize average food
-    best = None
-    best_food = None
-    for a0 in cand:
-        f0 = food_sum[a0] / i_cnt
-        if best is None or f0 > best_food:
-            best = a0
-            best_food = f0
+    # among candidates, pick the move with best (win + tiny food) score
+    best_score = None
+    best_moves = []
+    for a0 in candidate_set:
+        sc = scores[a0]
+        if (best_score is None) or (sc > best_score + 1e-12):
+            best_score = sc
+            best_moves = [a0]
+        elif abs(sc - best_score) <= 1e-12:
+            best_moves.append(a0)
 
-    final_moves = [a0 for a0 in cand if abs(food_sum[a0] / i_cnt - best_food) < 1e-9]
-    mv = random.choice(final_moves)
+    mv = random.choice(best_moves)
 
     if debug:
         print("\n=== DEBUG SCORES ===")
-        print(f"iterations: {i_cnt}, depth: {d_depth}")
-        print(f"{'move':<8}{'deaths':<8}{'bucket':<8}{'wins':<8}{'win_rate':<12}{'food_avg':<10}")
-        print("-" * 60)
+        print(f"iterations: {i_cnt}, depth: {d_depth}, food_bias: {food_bias}")
+        print(f"{'move':<8}{'deaths':<8}{'bucket':<8}{'wins':<8}"
+              f"{'win_rate':<12}{'food_avg':<10}{'score':<10}")
+        print("-" * 80)
         for a0 in root_moves:
             surv = max(1, i_cnt - deaths[a0])
             wr = wins[a0] / surv
             fa = food_sum[a0] / i_cnt
-            print(f"{a0:<8}{deaths[a0]:<8}{danger_bucket[a0]:<8}{wins[a0]:<8}{wr:<12.4f}{fa:<10.4f}")
+            sc = scores.get(a0, float('-inf')) if a0 in safe_set else float('-inf')
+            print(f"{a0:<8}{deaths[a0]:<8}{danger_bucket[a0]:<8}{wins[a0]:<8}"
+                  f"{wr:<12.4f}{fa:<10.4f}{sc:<10.4f}")
         print("chosen move:", mv)
         print("====================\n")
 
     return mv
+
 
 
 def battlesnake_move_response(j_str, i_cnt=None, d_depth=None):
