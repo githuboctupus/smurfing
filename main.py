@@ -6,8 +6,8 @@ import copy
 # CONFIG
 # =========================
 
-I = 70   # simulations per root move
-D = 5    # depth per simulation
+I = 200   # simulations per root move
+D = 8    # depth per simulation
 random.seed(42)
 
 dirs = ["up", "down", "left", "right"]
