@@ -1,1 +1,1 @@
-start: gunicorn --bind 0.0.0.0:$PORT geeked:app
+start: gunicorn --bind 0.0.0.0:$PORT main:app
