@@ -525,38 +525,33 @@ def battlesnake_move_response(j_str, i_cnt=None, d_depth=None):
 # =========================
 # You can comment this whole section out if you just want offline testing.
 
-if __name__ == "__main__":
-    try:
-        from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify
 
-        app = Flask(__name__)
+app = Flask(__name__)
 
-        @app.get("/")
-        def index():
-            return jsonify({
-                "apiversion": "1",
-                "author": "vector-space",
-                "color": "#00FF00",
-                "head": "safe",
-                "tail": "sharp",
-                "version": "0.1.0"
-            })
+@app.get("/")
+def index():
+    return jsonify({
+        "apiversion": "1",
+        "author": "me",
+        "color": "#00FF00",
+        "head": "safe",
+        "tail": "sharp",
+        "version": "0.1.0"
+    })
 
-        @app.post("/start")
-        def start():
-            return jsonify({"color": "#00FF00", "head": "safe", "tail": "sharp"})
+@app.post("/start")
+def start():
+    return jsonify({"color": "#00FF00", "head": "safe", "tail": "sharp"})
 
-        @app.post("/move")
-        def move():
-            j = request.get_json()
-            mv = choose_move_from_json(j)
-            return jsonify({"move": mv, "shout": "vector space survival"})
+@app.post("/move")
+def move():
+    j = request.get_json()
+    mv = choose_move_from_json(j)
+    return jsonify({"move": mv, "shout": ""})
 
-        @app.post("/end")
-        def end():
-            return jsonify({})
+@app.post("/end")
+def end():
+    return jsonify({})
 
-        app.run(host="0.0.0.0", port=8000, debug=False)
-    except ImportError:
-        # If Flask isn't installed, just do nothing on direct run
-        print("Flask not installed; run this file with Flask to use HTTP server.")
+app.run(host="0.0.0.0", port=8000, debug=False)
