@@ -539,7 +539,7 @@ def start():
 @app.post("/move")
 def move():
     j = request.get_json()
-    return battlesnake_move_response_minimax_tree(j_str, I=I_DEFAULT, max_depth=D_DEFAULT)
+    return battlesnake_move_response_minimax_tree(j, I=I_DEFAULT, max_depth=D_DEFAULT)
 
 @app.post("/end")
 def end():
