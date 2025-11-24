@@ -1,14 +1,15 @@
 import json
 import random
 import copy
+from collections import deque
 
-# =========================
-# CONFIG
-# =========================
+# Global search parameters (tune for speed/strength)
+I_DEFAULT = 1000   # number of simulations per turn
+D_DEFAULT = 8    # maximum depth of a single simulation
 
-I = 300   # simulations per root move
-D = 8    # depth per simulation
-
+# Random seed (set to None for fully random behavior)
+r0 = None
+# Directions and vector deltas
 dirs = ["up", "down", "left", "right"]
 dirm = {
     "up":    (0, 1),
@@ -17,555 +18,504 @@ dirm = {
     "right": (1, 0),
 }
 
-# =========================
-# BASIC GEOMETRY / HELPERS
-# =========================
-
-def p_add(a, b):
-    return (a[0] + b[0], a[1] + b[1])
-
-
-def in_bounds(s, p):
-    w = s["w"]
-    h = s["h"]
-    x, y = p
+def in_bounds(x, y, w, h):
     return 0 <= x < w and 0 <= y < h
 
-
-# =========================
-# STATE PARSING
-# =========================
-
 def s_from_json(j):
-    g = j["board"]
-    w = g["width"]
-    h = g["height"]
+    """Convert Battlesnake JSON game state into internal state dict.
 
-    f = [(a["x"], a["y"]) for a in g.get("food", [])]
-    hz = g.get("hazards", [])
-    z = [(a["x"], a["y"]) for a in hz]
+State format:
+  s = {
+    'w': width,
+    'h': height,
+    'sn': [
+        {
+          'id': snake_id,
+          'b': [(x_head, y_head), ..., (x_tail, y_tail)],
+          'hp': health,
+          'alive': True/False,
+        }, ...
+    ],
+    'yi': index of our snake in sn,
+    'f': [(fx, fy), ...]  # food positions
+  }
+    """
+    board = j["board"]
+    w, h = board["width"], board["height"]
+    snakes_json = board["snakes"]
+    food_json = board.get("food", [])
+
+    you_id = j["you"]["id"]
 
     sn = []
-    yi = None
+    yi = 0
+    for idx, sj in enumerate(snakes_json):
+        sid = sj["id"]
+        body_coords = [(seg["x"], seg["y"]) for seg in sj["body"]]
+        hp = sj.get("health", 100)
+        alive = sj.get("eliminated_cause") is None if "eliminated_cause" in sj else True
+        sn.append({
+            "id": sid,
+            "b": body_coords,
+            "hp": hp,
+            "alive": alive,
+        })
+        if sid == you_id:
+            yi = idx
 
-    for i, s0 in enumerate(g["snakes"]):
-        b = [(a["x"], a["y"]) for a in s0["body"]]
-        s1 = {
-            "id": s0["id"],
-            "hp": s0.get("health", 100),
-            "b": b,
-            "alive": True,
-        }
-        sn.append(s1)
-
-    yid = j["you"]["id"]
-    for i, s1 in enumerate(sn):
-        if s1["id"] == yid:
-            yi = i
-            break
+    food = [(f["x"], f["y"]) for f in food_json]
 
     s = {
         "w": w,
         "h": h,
-        "f": f,
-        "z": z,
         "sn": sn,
         "yi": yi,
+        "f": food,
     }
     return s
 
+def state_copy(s):
+    """Deep copy of state dict."""
+    return copy.deepcopy(s)
 
-# =========================
-# STEP GAME ONE TURN (IN PLACE)
-# =========================
 
-def step_state_inplace(s, m):
-    sn = s["sn"]
-    f = s["f"]
-
-    # 0) health tick
-    for a in sn:
+def compute_occupied_cells(s):
+    """Return a set of (x, y) cells occupied by any alive snake body."""
+    occ = set()
+    for a in s["sn"]:
         if not a["alive"]:
             continue
-        a["hp"] -= 1
-
-    # 1) new heads
-    nh = {}
-    for a in sn:
-        if not a["alive"]:
-            continue
-        sid = a["id"]
-        if a["hp"] <= 0:
-            a["alive"] = False
-            continue
-        b = a["b"]
-        h0 = b[0]
-        mv = m.get(sid)
-        if mv is None:
-            h1 = h0
-        else:
-            h1 = p_add(h0, dirm[mv])
-        nh[sid] = h1
-
-    # 2) who eats?
-    eat = {}
-    for a in sn:
-        if not a["alive"]:
-            continue
-        sid = a["id"]
-        if sid not in nh:
-            eat[sid] = False
-            continue
-        h1 = nh[sid]
-        eat[sid] = h1 in f
-
-    # 3) compute new bodies (temporary)
-    body_cells = {}
-    for a in sn:
-        if not a["alive"]:
-            continue
-        sid = a["id"]
-        if sid not in nh:
-            continue
-        b = a["b"]
-        h1 = nh[sid]
-        if eat[sid]:
-            nb = [h1] + b
-        else:
-            if len(b) > 1:
-                nb = [h1] + b[:-1]
-            else:
-                nb = [h1]
-        a["_nb"] = nb
-
-    # fill body cells (skip heads)
-    for a in sn:
-        if not a["alive"]:
-            continue
-        sid = a["id"]
-        if "_nb" not in a:
-            continue
-        nb = a["_nb"]
-        for p in nb[1:]:
-            body_cells.setdefault(p, []).append(sid)
-
-    # 4) out-of-bounds + body collisions
-    dead_heads = set()
-    for a in sn:
-        if not a["alive"]:
-            continue
-        sid = a["id"]
-        if sid not in nh:
-            continue
-        h1 = nh[sid]
-        if not in_bounds(s, h1) or h1 in body_cells:
-            dead_heads.add(sid)
-
-    # 5) head-to-head collisions
-    hh = {}
-    for a in sn:
-        if not a["alive"]:
-            continue
-        sid = a["id"]
-        if sid in dead_heads or sid not in nh:
-            continue
-        h1 = nh[sid]
-        hh.setdefault(h1, []).append(a)
-
-    for p, lst in hh.items():
-        if len(lst) <= 1:
-            continue
-        mx = max(len(a["b"]) for a in lst)
-        winners = [a for a in lst if len(a["b"]) == mx]
-        if len(winners) >= 2:
-            for a in lst:
-                dead_heads.add(a["id"])
-        else:
-            w0 = winners[0]["id"]
-            for a in lst:
-                if a["id"] != w0:
-                    dead_heads.add(a["id"])
-
-    # 6) remove eaten food
-    eaten_points = set()
-    for a in sn:
-        sid = a["id"]
-        if not a["alive"] or sid in dead_heads or sid not in nh:
-            continue
-        if nh[sid] in f:
-            eaten_points.add(nh[sid])
-    s["f"] = [p for p in f if p not in eaten_points]
-
-    # finalize snakes
-    for a in sn:
-        sid = a["id"]
-        if not a["alive"]:
-            continue
-        if sid in dead_heads:
-            a["alive"] = False
-            continue
-        if "_nb" in a:
-            a["b"] = a["_nb"]
-            del a["_nb"]
-        if eat.get(sid, False) and a["alive"]:
-            a["hp"] = 100
-
-    return s
-
-
-# =========================
-# SAFE MOVES (WITH HEAD THREATS)
-# =========================
+        for (x, y) in a["b"]:
+            occ.add((x, y))
+    return occ
 
 def safe_moves(s, idx):
+    """Return a list of moves that do not immediately hit a wall or body.
+
+This is conservative: it does not allow moving into any currently occupied
+cell, even our own tail.
     """
-    Return all non-suicidal moves for snake index idx.
-    Non-suicidal:
-      - stays on board
-      - does NOT hit any body segment
-      - does NOT step into a tile that any equal/bigger head
-        could move to next turn (head-to-head threat)
-    If no such moves exist, we relax to threatened-but-not-immediate-suicide moves.
-    If even those don't exist, we return any in-bounds moves.
+    w, h = s["w"], s["h"]
+    sn = s["sn"]
+    me = sn[idx]
+    head = me["b"][0]
+    hx, hy = head
+
+    occ = compute_occupied_cells(s)
+    safe = []
+    for mv in dirs:
+        dx, dy = dirm[mv]
+        nx, ny = hx + dx, hy + dy
+        if not in_bounds(nx, ny, w, h):
+            continue
+        if (nx, ny) in occ:
+            continue
+        safe.append(mv)
+    return safe
+def step_state_inplace(s, moves):
+    """Advance the game state by one turn using Battlesnake-like rules.
+    - moves: dict snake_id -> move_str ('up', 'down', 'left', 'right')
+    Modifies s in place.
     """
+    w, h = s["w"], s["h"]
+    sn = s["sn"]
+    food = s["f"]
+    food_set = set(food)
+
+    # Pre-move snapshot
+    old_bodies = [list(a["b"]) for a in sn]
+    old_hps = [a["hp"] for a in sn]
+    lengths = [len(a["b"]) for a in sn]
+    alive = [a["alive"] for a in sn]
+
+    # Compute intended new heads
+    new_heads = [None] * len(sn)
+    will_eat = [False] * len(sn)
+
+    for i, a in enumerate(sn):
+        if not alive[i]:
+            continue
+        mv = moves.get(a["id"], None)
+        if mv is None:
+            # If no move given, snake dies
+            alive[i] = False
+            continue
+        hx, hy = old_bodies[i][0]
+        dx, dy = dirm[mv]
+        nx, ny = hx + dx, hy + dy
+        new_heads[i] = (nx, ny)
+        if (nx, ny) in food_set:
+            will_eat[i] = True
+
+    # Wall collisions
+    for i, pos in enumerate(new_heads):
+        if not alive[i]:
+            continue
+        if pos is None:
+            alive[i] = False
+            continue
+        x, y = pos
+        if not in_bounds(x, y, w, h):
+            alive[i] = False
+
+    # Body collisions (bodies that remain after tails move if not eating)
+    occupied_next = set()
+    for i, body in enumerate(old_bodies):
+        if not alive[i]:
+            continue
+        L = len(body)
+        for j, (x, y) in enumerate(body):
+            # If tail and not eating, this cell will be vacated
+            if j == L - 1 and not will_eat[i]:
+                continue
+            occupied_next.add((x, y))
+
+    for i, pos in enumerate(new_heads):
+        if not alive[i] or pos is None:
+            continue
+        if pos in occupied_next:
+            alive[i] = False
+
+    # Head-to-head collisions
+    head_pos_groups = {}
+    for i, pos in enumerate(new_heads):
+        if not alive[i] or pos is None:
+            continue
+        head_pos_groups.setdefault(pos, []).append(i)
+
+    for pos, idxs in head_pos_groups.items():
+        if len(idxs) > 1:
+            max_len = max(lengths[i] for i in idxs)
+            # shorter snakes die
+            for i in idxs:
+                if lengths[i] < max_len:
+                    alive[i] = False
+            # if all same length, all die
+            if all(lengths[i] == max_len for i in idxs):
+                for i in idxs:
+                    alive[i] = False
+
+    # Update snakes: bodies, health, deaths from starvation
+    new_food_set = set(food_set)
+    for i, a in enumerate(sn):
+        if not alive[i]:
+            a["alive"] = False
+            continue
+
+        old_body = old_bodies[i]
+        head = new_heads[i]
+        if head is None:
+            a["alive"] = False
+            alive[i] = False
+            continue
+
+        if will_eat[i]:
+            new_body = [head] + old_body
+            new_hp = 100
+            if head in new_food_set:
+                new_food_set.remove(head)
+        else:
+            new_body = [head] + old_body[:-1]
+            new_hp = old_hps[i] - 1
+
+        if new_hp <= 0:
+            a["alive"] = False
+            alive[i] = False
+            continue
+
+        a["b"] = new_body
+        a["hp"] = new_hp
+        a["alive"] = True
+
+    s["f"] = list(new_food_set)
+
+def floodfill_area(s, idx):
+    """Return the number of free cells reachable by snake idx.
+    Simple BFS that treats all bodies as walls (no phasing).
+    """
+    w, h = s["w"], s["h"]
     sn = s["sn"]
     me = sn[idx]
     if not me["alive"]:
-        return []
+        return 0
 
-    my_len = len(me["b"])
-    my_head = me["b"][0]
-
-    # build body set
-    body = set()
+    occupied = set()
     for a in sn:
         if not a["alive"]:
             continue
-        for p in a["b"]:
-            body.add(p)
+        for (x, y) in a["b"]:
+            occupied.add((x, y))
 
-    # find threat squares from bigger/equal heads
-    head_threat = set()
-    for j, a in enumerate(sn):
-        if j == idx or not a["alive"]:
-            continue
-        opp_len = len(a["b"])
-        opp_head = a["b"][0]
-        if opp_len >= my_len:
-            for mv in dirs:
-                p = p_add(opp_head, dirm[mv])
-                if in_bounds(s, p):
-                    head_threat.add(p)
+    head = me["b"][0]
+    q = deque([head])
+    seen = {head}
+    area = 0
 
-    good = []
-    fallback = []
-
-    for mv in dirs:
-        new = p_add(my_head, dirm[mv])
-
-        if not in_bounds(s, new):
-            continue
-        if new in body:
-            continue
-
-        if new in head_threat:
-            fallback.append(mv)
-        else:
-            good.append(mv)
-
-    if good:
-        return good
-    if fallback:
-        return fallback
-
-    # truly trapped: any in-bounds move
-    legal = []
-    for mv in dirs:
-        new = p_add(my_head, dirm[mv])
-        if in_bounds(s, new):
-            legal.append(mv)
-    return legal
-
-
-# =========================
-# OPPONENT PATH SAMPLER (VECTOR SPACE ELEMENT)
-# =========================
-
-def sample_paths(s0, d):
-    """
-    Sample one vector-space element:
-    For each opponent and each step 0..d-1, choose a random non-suicidal move if possible.
-    """
-    s1 = copy.deepcopy(s0)
-    sn = s1["sn"]
-    yi = s1["yi"]
-
-    w0 = {}
-    for idx, a in enumerate(sn):
-        if not a["alive"]:
-            continue
-        w0[a["id"]] = []
-
-    for t in range(d):
-        m = {}
-        sn = s1["sn"]
-        for idx, a in enumerate(sn):
-            if idx == yi:
+    while q:
+        x, y = q.popleft()
+        area += 1
+        for dx, dy in dirm.values():
+            nx, ny = x + dx, y + dy
+            if not in_bounds(nx, ny, w, h):
                 continue
-            if not a["alive"]:
-                sid = a["id"]
-                w0[sid].append(None)
+            if (nx, ny) in seen:
                 continue
-            sid = a["id"]
-            ms = safe_moves(s1, idx)
-            if not ms:
-                mv = random.choice(dirs)
-            else:
-                mv = random.choice(ms)
-            w0[sid].append(mv)
-            m[sid] = mv
+            if (nx, ny) in occupied:
+                continue
+            seen.add((nx, ny))
+            q.append((nx, ny))
 
-        if m:
-            step_state_inplace(s1, m)
-
-    return w0
+    return area
 
 
-# =========================
-# ONE SCENARIO SIMULATION (STATE VERSION)
-# =========================
-
-def simulate_scenario_state(s0, a0, w0, d):
+def evaluate_state(s):
     """
-    Run one scenario simulation starting from state s0.
-
-    a0: root move ("up"/"down"/"left"/"right")
-    w0: sampled opponent paths (dict snake_id -> list of moves)
-    d: depth
-
-    Returns:
-      died: True if you died in this scenario
-      food_eaten: how many segments you grew (earlier food weighted more)
-      win: True if at least one opponent died before you
+    Heuristic score for a state.
+    - huge negative if we are dead
+    - otherwise: combine:
+      * our reachable area (floodfill)
+      * enemy area
+      * our health
+      * nearby food
+      * our length (slightly more important when low HP)
     """
-    s = copy.deepcopy(s0)
     sn = s["sn"]
     yi = s["yi"]
-    yid = sn[yi]["id"]
+    me = sn[yi]
 
-    fe = 0
-    w1 = False
+    # Hard death penalty
+    if not me["alive"]:
+        return -1e9
 
-    # turn 0
-    sn = s["sn"]
-    y = sn[yi]
-    prev_len = len(y["b"])
+    # ---------- 1) Space control ----------
+    my_area = floodfill_area(s, yi)
 
-    m = {yid: a0}
-    for a in sn:
-        sid = a["id"]
-        if sid != yid and sid in w0:
-            m[sid] = w0[sid][0]
-
-    step_state_inplace(s, m)
-
-    sn = s["sn"]
-    y = sn[yi]
-    new_len = len(y["b"])
-    if y["alive"]:
-        dl = new_len - prev_len
-        if dl > 0:
-            # earlier turns get higher weight
-            fe += dl * (d - 0)
-
-    if not y["alive"]:
-        return True, fe, False
-
-    # opponent died?
+    max_enemy_area = 0
     for i, a in enumerate(sn):
-        if i != yi and not a["alive"]:
-            return False, fe, True
+        if i == yi or not a["alive"]:
+            continue
+        ea = floodfill_area(s, i)
+        if ea > max_enemy_area:
+            max_enemy_area = ea
 
-    # future turns
-    for t in range(1, d):
-        sn = s["sn"]
-        y = sn[yi]
-        if not y["alive"]:
-            return True, fe, w1
-
-        ms = safe_moves(s, yi)
-        if not ms:
-            a1 = random.choice(dirs)
-        else:
-            a1 = random.choice(ms)
-
-        m = {yid: a1}
-        for a in sn:
-            sid = a["id"]
-            if sid != yid and sid in w0 and t < len(w0[sid]):
-                m[sid] = w0[sid][t]
-
-        prev_len = len(s["sn"][yi]["b"])
-        step_state_inplace(s, m)
-        new_len = len(s["sn"][yi]["b"])
-
-        if y["alive"]:
-            dl = new_len - prev_len
-            if dl > 0:
-                # earlier turns get higher weight
-                fe += dl * (d - t)
-
-        if not y["alive"]:
-            return True, fe, w1
-
-        for i, a in enumerate(sn):
-            if i != yi and not a["alive"]:
-                w1 = True
-                return False, fe, w1
-
-    return False, fe, w1
-
-
-# =========================
-# ROOT MOVE SELECTION
-# =========================
-
-def choose_move_from_json(j, i_cnt=None, d_depth=None, debug=False):
-    if i_cnt is None:
-        i_cnt = I
-    if d_depth is None:
-        d_depth = D
-
-    s0 = s_from_json(j)
-    sn0 = s0["sn"]
-    yi = s0["yi"]
-    y0 = sn0[yi]
-    yid = y0["id"]
-
-    root_moves = safe_moves(s0, yi)
-    if not root_moves:
-        root_moves = dirs[:]
-
-    deaths = {}
-    wins = {}
-    food_sum = {}
-
-    for a0 in root_moves:
-        deaths[a0] = 0
-        wins[a0] = 0
-        food_sum[a0] = 0
-
-        for _ in range(i_cnt):
-            w0 = sample_paths(s0, d_depth)
-            died, fe, w1 = simulate_scenario_state(s0, a0, w0, d_depth)
-            if died:
-                deaths[a0] += 1
-            if w1:
-                wins[a0] += 1
-            food_sum[a0] += fe
-
-    # bucketed death probability (don't-die objective)
-    alpha = 1.0
-    bucket_size = 0.05  # your updated value
-
-    danger_bucket = {}
-    for a0 in root_moves:
-        p = (deaths[a0] + alpha) / (i_cnt + 2 * alpha)
-        b = int(p / bucket_size)
-        danger_bucket[a0] = b
-
-    # step 1: safest bucket only
-    mb = min(danger_bucket[a0] for a0 in root_moves)
-    safe_set = [a0 for a0 in root_moves if danger_bucket[a0] == mb]
-
-    # ---- PESSIMISTIC scoring inside the safest bucket ----
-    # Base score: win_rate + food_bias * avg_food
-    # Pessimism: subtract a penalty based on death_fraction,
-    #            but only once it exceeds a small threshold.
-    food_bias = 0.1
-    risk_threshold = 0.10   # <=10% "terrible scenarios" is tolerated
-    risk_scale = 40.0       # how hard we punish beyond the threshold
-
-    scores = {}
-
-    for a0 in safe_set:
-        # survivals for this move
-        surv = max(1, i_cnt - deaths[a0])
-        win_rate = wins[a0] / surv
-        avg_food = food_sum[a0] / surv  # avg early-weighted food over survivals
-
-        # how many sims are "terrible" = deaths / total sims
-        death_fraction = deaths[a0] / i_cnt
-
-        # pessimistic penalty: nothing if small, grows once over threshold
-        if death_fraction > risk_threshold:
-            penalty = risk_scale * (death_fraction - risk_threshold)
-        else:
-            penalty = 0.0
-
-        scores[a0] = win_rate + food_bias * avg_food - penalty
-
-    # If any move is a "guaranteed win" (wins == survivals), restrict to those
-    gw = []
-    for a0 in safe_set:
-        surv = i_cnt - deaths[a0]
-        if surv > 0 and wins[a0] == surv:
-            gw.append(a0)
-
-    if gw:
-        candidate_set = gw
-    else:
-        candidate_set = safe_set
-
-    # among candidates, pick the move with best pessimistic score
-    best_score = None
-    best_moves = []
-    for a0 in candidate_set:
-        sc = scores[a0]
-        if (best_score is None) or (sc > best_score + 1e-12):
-            best_score = sc
-            best_moves = [a0]
-        elif abs(sc - best_score) <= 1e-12:
-            best_moves.append(a0)
-
-    mv = random.choice(best_moves)
-
-    if debug:
-        print("\n=== DEBUG SCORES (PESSIMISTIC) ===")
-        print(f"iterations: {i_cnt}, depth: {d_depth}, food_bias: {food_bias}")
-        print(f"{'move':<8}{'deaths':<8}{'bucket':<8}{'wins':<8}"
-              f"{'death_fr':<10}{'win_rate':<12}{'food_avg':<10}{'penalty':<10}{'score':<10}")
-        print("-" * 110)
-        for a0 in root_moves:
-            surv = max(1, i_cnt - deaths[a0])
-            win_rate = wins[a0] / surv
-            fa = food_sum[a0] / surv if surv > 0 else 0.0
-            death_fraction = deaths[a0] / i_cnt
-            if death_fraction > risk_threshold:
-                penalty = risk_scale * (death_fraction - risk_threshold)
+    # ---------- 2) Food proximity (same as before) ----------
+    head = me["b"][0]
+    hx, hy = head
+    food_bonus = 0
+    for (fx, fy) in s["f"]:
+        dist = abs(fx - hx) + abs(fy - hy)
+        if dist <= 6:
+            if me["hp"] < 30:
+                food_bonus += max(0, 6 - dist)
             else:
-                penalty = 0.0
-            sc = scores.get(a0, float('-inf')) if a0 in safe_set else float('-inf')
-            print(f"{a0:<8}{deaths[a0]:<8}{danger_bucket[a0]:<8}{wins[a0]:<8}"
-                  f"{death_fraction:<10.3f}{win_rate:<12.4f}{fa:<10.4f}{penalty:<10.4f}{sc:<10.4f}")
-        print("chosen move:", mv)
-        print("====================\n")
+                food_bonus += max(0, 3 - dist)
 
-    return mv
+    # ---------- 3) Length term (slightly stronger when low HP) ----------
+    my_len = len(me["b"])
+    hp = me["hp"]
 
-def battlesnake_move_response(j_str, i_cnt=None, d_depth=None):
-    j = json.loads(j_str)
-    mv = choose_move_from_json(j, i_cnt=i_cnt, d_depth=d_depth)
+    # base weight for length
+    base_len_weight = 0.2
+    # when HP < 30, increase length weight up to +30% at HP = 0
+    if hp < 30:
+        low_hp_factor = 1.0 + 0.3 * (30 - hp) / 30.0   # ranges from 1.0 to 1.3
+    else:
+        low_hp_factor = 1.0
+
+    effective_len_weight = base_len_weight * low_hp_factor
+
+    # ---------- 4) Combine terms ----------
+    space_weight   = 1.0
+    control_weight = 0.5
+    health_weight  = 0.1
+    food_weight    = 0.1
+
+    control_term = my_area - max_enemy_area
+
+    score  = 0.0
+    score += space_weight   * my_area
+    score += control_weight * control_term
+    score += health_weight  * hp
+    score += food_weight    * food_bonus
+    score += effective_len_weight * my_len
+
+    return score
+
+
+def random_enemy_moves(s, my_idx):
+    """For each enemy snake, pick a random safe move (or random legal move)."""
+    sn = s["sn"]
+    moves = {}
+    for i, a in enumerate(sn):
+        if not a["alive"]:
+            continue
+        if i == my_idx:
+            continue
+        safe = safe_moves(s, i)
+        if safe:
+            mv = random.choice(safe)
+        else:
+            mv = random.choice(dirs)
+        moves[a["id"]] = mv
+    return moves
+
+
+def make_game_node(state):
     return {
-        "move": mv,
-        "shout": f"vector space survival: {mv}",
+        "type": "game",
+        "state": state,
+        "children": {},   # move_str -> decision_node
+        "value": None,
     }
 
 
-# =========================
-# OPTIONAL: FLASK SERVER FOR BATTLESNAKE
-# =========================
-# You can comment this whole section out if you just want offline testing.
+def make_decision_node(move, parent_state):
+    return {
+        "type": "decision",
+        "move": move,
+        "parent_state": parent_state,
+        "children": [],   # list of game_nodes
+        "value": None,
+    }
+
+
+def expand_game_node(node):
+    """Expand a game node by creating one Decision node per safe move."""
+    assert node["type"] == "game"
+    s = node["state"]
+    yi = s["yi"]
+
+    my_moves = safe_moves(s, yi)
+    if not my_moves:
+        my_moves = dirs[:]  # trapped fallback
+
+    for mv in my_moves:
+        if mv not in node["children"]:
+            node["children"][mv] = make_decision_node(mv, s)
+
+
+def expand_decision_node(node):
+    """Expand a decision node by sampling ONE random enemy response
+    and creating ONE new GameNode child.
+    """
+    assert node["type"] == "decision"
+    parent_state = node["parent_state"]
+    s1 = state_copy(parent_state)
+    sn1 = s1["sn"]
+    yi = s1["yi"]
+    me1 = sn1[yi]
+
+    moves = {me1["id"]: node["move"]}
+    enemy_moves = random_enemy_moves(s1, yi)
+    moves.update(enemy_moves)
+
+    step_state_inplace(s1, moves)
+
+    child_game = make_game_node(s1)
+    node["children"].append(child_game)
+    return child_game
+
+def simulate_once(root, max_depth=D_DEFAULT):
+    """Run one tree simulation starting from root GameNode.
+    Uses random selection among children, expands nodes when needed,
+    and backs up values using minimax semantics.
+    """
+    node = root
+    path = []
+    depth = 0
+
+    while True:
+        path.append(node)
+
+        if depth >= max_depth:
+            break
+
+        if node["type"] == "game":
+            s = node["state"]
+            sn = s["sn"]
+            yi = s["yi"]
+            me = sn[yi]
+            if not me["alive"]:
+                break
+
+            if not node["children"]:
+                expand_game_node(node)
+
+            node = random.choice(list(node["children"].values()))
+
+        else:  # decision node
+            if not node["children"]:
+                node = expand_decision_node(node)
+            else:
+                node = random.choice(node["children"])
+
+        depth += 1
+
+        # Ensure we end on a GameNode for evaluation
+        if depth >= max_depth and node["type"] == "decision":
+            node = expand_decision_node(node)
+            path.append(node)
+            break
+
+    if node["type"] != "game":
+        return
+
+    leaf_value = evaluate_state(node["state"])
+    node["value"] = leaf_value
+
+    # Backup along the path
+    for n in reversed(path):
+        if n["type"] == "game":
+            if not n["children"]:
+                if n["value"] is None:
+                    n["value"] = evaluate_state(n["state"])
+            else:
+                vals = [child["value"] for child in n["children"].values() if child["value"] is not None]
+                if vals:
+                    n["value"] = max(vals)
+        else:  # decision node
+            if n["children"]:
+                vals = [child["value"] for child in n["children"] if child["value"] is not None]
+                if vals:
+                    n["value"] = min(vals)
+
+def choose_move_minimax_tree_from_json(j, I=I_DEFAULT, max_depth=D_DEFAULT, debug=False):
+    """Full minimax-style tree search with random rollouts for enemy moves."""
+    s0 = s_from_json(j)
+    root = make_game_node(s0)
+
+    for _ in range(I):
+        simulate_once(root, max_depth=max_depth)
+
+    if not root["children"]:
+        yi = s0["yi"]
+        my_moves = safe_moves(s0, yi)
+        if not my_moves:
+            my_moves = dirs[:]
+        return random.choice(my_moves)
+
+    move_values = {}
+    for mv, dnode in root["children"].items():
+        move_values[mv] = dnode["value"] if dnode["value"] is not None else -1e9
+
+    best_move = max(move_values.keys(), key=lambda mv: move_values[mv])
+
+    if debug:
+        print("Root move values (minimax tree):")
+        for mv in sorted(move_values.keys()):
+            print(f"{mv:>5}: {move_values[mv]:8.2f}")
+        print("Chosen move:", best_move)
+
+    return best_move
+
+
+def battlesnake_move_response_minimax_tree(j_str, I=I_DEFAULT, max_depth=D_DEFAULT):
+    j = json.loads(j_str)
+    mv = choose_move_minimax_tree_from_json(j, I=I, max_depth=max_depth)
+    return {
+        "move": mv,
+        "shout": f"",
+    }
 
 from flask import Flask, request, jsonify
 
@@ -589,8 +539,7 @@ def start():
 @app.post("/move")
 def move():
     j = request.get_json()
-    mv = choose_move_from_json(j)
-    return jsonify({"move": mv, "shout": ""})
+    return battlesnake_move_response_minimax_tree(j_str, I=I_DEFAULT, max_depth=D_DEFAULT)
 
 @app.post("/end")
 def end():
