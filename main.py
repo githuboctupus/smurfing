@@ -6,9 +6,8 @@ import copy
 # CONFIG
 # =========================
 
-I = 200   # simulations per root move
+I = 300   # simulations per root move
 D = 8    # depth per simulation
-random.seed(42)
 
 dirs = ["up", "down", "left", "right"]
 dirm = {
@@ -346,7 +345,7 @@ def simulate_scenario_state(s0, a0, w0, d):
 
     Returns:
       died: True if you died in this scenario
-      food_eaten: how many segments you grew
+      food_eaten: how many segments you grew (earlier food weighted more)
       win: True if at least one opponent died before you
     """
     s = copy.deepcopy(s0)
@@ -358,6 +357,10 @@ def simulate_scenario_state(s0, a0, w0, d):
     w1 = False
 
     # turn 0
+    sn = s["sn"]
+    y = sn[yi]
+    prev_len = len(y["b"])
+
     m = {yid: a0}
     for a in sn:
         sid = a["id"]
@@ -368,13 +371,19 @@ def simulate_scenario_state(s0, a0, w0, d):
 
     sn = s["sn"]
     y = sn[yi]
+    new_len = len(y["b"])
+    if y["alive"]:
+        dl = new_len - prev_len
+        if dl > 0:
+            # earlier turns get higher weight
+            fe += dl * (d - 0)
+
     if not y["alive"]:
         return True, fe, False
 
     # opponent died?
     for i, a in enumerate(sn):
         if i != yi and not a["alive"]:
-            fe = max(0, len(y["b"]) - len(s0["sn"][yi]["b"]))
             return False, fe, True
 
     # future turns
@@ -403,7 +412,8 @@ def simulate_scenario_state(s0, a0, w0, d):
         if y["alive"]:
             dl = new_len - prev_len
             if dl > 0:
-                fe += dl
+                # earlier turns get higher weight
+                fe += dl * (d - t)
 
         if not y["alive"]:
             return True, fe, w1
@@ -456,7 +466,7 @@ def choose_move_from_json(j, i_cnt=None, d_depth=None, debug=False):
 
     # bucketed death probability (don't-die objective)
     alpha = 1.0
-    bucket_size = 0.1
+    bucket_size = 0.05  # changed from 0.1
 
     danger_bucket = {}
     for a0 in root_moves:
@@ -468,16 +478,16 @@ def choose_move_from_json(j, i_cnt=None, d_depth=None, debug=False):
     mb = min(danger_bucket[a0] for a0 in root_moves)
     safe_set = [a0 for a0 in root_moves if danger_bucket[a0] == mb]
 
-    # ---- NEW: mix in a small food bias inside the safest bucket ----
+    # ---- food bias inside the safest bucket ----
     # score = win_rate + food_bias * avg_food
-    # keep the don't-die objective first (buckets), then use this score.
-    food_bias = 0.1  # tweak this: 0.05 = very small, 0.2 = more hungry
+    food_bias = 0.1  # per your request
     scores = {}
 
     for a0 in safe_set:
         surv = max(1, i_cnt - deaths[a0])
         win_rate = wins[a0] / surv
-        avg_food = food_sum[a0] / i_cnt
+        # average food score over survivals (earlier food already weighted in fe)
+        avg_food = food_sum[a0] / surv
         scores[a0] = win_rate + food_bias * avg_food
 
     # If any move is a "guaranteed win" (wins == survivals), restrict to those
@@ -492,7 +502,7 @@ def choose_move_from_json(j, i_cnt=None, d_depth=None, debug=False):
     else:
         candidate_set = safe_set
 
-    # among candidates, pick the move with best (win + tiny food) score
+    # among candidates, pick the move with best (win + food) score
     best_score = None
     best_moves = []
     for a0 in candidate_set:
@@ -514,7 +524,7 @@ def choose_move_from_json(j, i_cnt=None, d_depth=None, debug=False):
         for a0 in root_moves:
             surv = max(1, i_cnt - deaths[a0])
             wr = wins[a0] / surv
-            fa = food_sum[a0] / i_cnt
+            fa = food_sum[a0] / surv
             sc = scores.get(a0, float('-inf')) if a0 in safe_set else float('-inf')
             print(f"{a0:<8}{deaths[a0]:<8}{danger_bucket[a0]:<8}{wins[a0]:<8}"
                   f"{wr:<12.4f}{fa:<10.4f}{sc:<10.4f}")
@@ -522,7 +532,6 @@ def choose_move_from_json(j, i_cnt=None, d_depth=None, debug=False):
         print("====================\n")
 
     return mv
-
 
 
 def battlesnake_move_response(j_str, i_cnt=None, d_depth=None):
