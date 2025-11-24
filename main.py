@@ -4,11 +4,12 @@ import copy
 from collections import deque
 
 # Global search parameters (tune for speed/strength)
-I_DEFAULT = 1000   # number of simulations per turn
+I_DEFAULT = 500   # number of simulations per turn
 D_DEFAULT = 8    # maximum depth of a single simulation
 
 # Random seed (set to None for fully random behavior)
 r0 = None
+
 # Directions and vector deltas
 dirs = ["up", "down", "left", "right"]
 dirm = {
@@ -44,7 +45,6 @@ State format:
     w, h = board["width"], board["height"]
     snakes_json = board["snakes"]
     food_json = board.get("food", [])
-
     you_id = j["you"]["id"]
 
     sn = []
@@ -72,6 +72,7 @@ State format:
         "yi": yi,
         "f": food,
     }
+    s["init_len"] = len(s["sn"][s["yi"]]["b"])
     return s
 
 def state_copy(s):
@@ -112,6 +113,8 @@ cell, even our own tail.
             continue
         safe.append(mv)
     return safe
+
+
 def step_state_inplace(s, moves):
     """Advance the game state by one turn using Battlesnake-like rules.
     - moves: dict snake_id -> move_str ('up', 'down', 'left', 'right')
@@ -229,44 +232,136 @@ def step_state_inplace(s, moves):
 
     s["f"] = list(new_food_set)
 
-def floodfill_area(s, idx):
-    """Return the number of free cells reachable by snake idx.
-    Simple BFS that treats all bodies as walls (no phasing).
+
+from collections import defaultdict
+import math
+
+def compute_areas(s):
     """
-    w, h = s["w"], s["h"]
+    Dynamic territory floodfill with progressive tail-decay.
+    Does NOT mutate bodies. Instead precomputes when each body tile becomes walkable.
+    This is the most efficient and correct approach.
+    """
+
     sn = s["sn"]
-    me = sn[idx]
-    if not me["alive"]:
-        return 0
+    yi = s["yi"]
+    w, h = s["w"], s["h"]
+    dirs = list(dirm.values())
 
-    occupied = set()
-    for a in sn:
-        if not a["alive"]:
+    # ---------------------------------------------------
+    # 1. Precompute walkable_at time for every tile
+    # ---------------------------------------------------
+    walkable_at = {}
+
+    # all empty tiles default to walkable at time 0
+    for x in range(w):
+        for y in range(h):
+            walkable_at[(x, y)] = 0
+
+    # overwrite body tiles with actual times
+    for snake in sn:
+        if not snake["alive"]:
             continue
-        for (x, y) in a["b"]:
-            occupied.add((x, y))
 
-    head = me["b"][0]
-    q = deque([head])
-    seen = {head}
-    area = 0
+        body = snake["b"]
+        L = len(body)
 
-    while q:
-        x, y = q.popleft()
-        area += 1
-        for dx, dy in dirm.values():
-            nx, ny = x + dx, y + dy
-            if not in_bounds(nx, ny, w, h):
-                continue
-            if (nx, ny) in seen:
-                continue
-            if (nx, ny) in occupied:
-                continue
-            seen.add((nx, ny))
-            q.append((nx, ny))
+        # head is blocked forever (other snakes can't walk on it)
+        hx, hy = body[0]
+        walkable_at[(hx, hy)] = math.inf
 
-    return area
+        # inner segments open when tail eventually reaches them
+        # e.g., k steps from head: opens at (L-1 - k)
+        for k in range(1, L - 1):
+            x, y = body[k]
+            walkable_at[(x, y)] = (L - 1) - k
 
+        # tail becomes free next turn
+        if L > 1:
+            tx, ty = body[-1]
+            walkable_at[(tx, ty)] = 1
+
+    # ---------------------------------------------------
+    # 2. Multi-source BFS initialization
+    # ---------------------------------------------------
+    dist = {}                # (x,y) -> earliest distance
+    claimants = defaultdict(set)
+    frontier = []
+
+    for i, snake in enumerate(sn):
+        if not snake["alive"]:
+            continue
+        hx, hy = snake["b"][0]
+        dist[(hx, hy)] = 0
+        claimants[(hx, hy)].add(i)
+        frontier.append((hx, hy, i))
+
+    d = 0  # BFS layer
+
+    # ---------------------------------------------------
+    # 3. BFS with dynamic walkability
+    # ---------------------------------------------------
+    while frontier:
+        next_frontier = []
+
+        for (x, y, idx) in frontier:
+            for dx, dy in dirs:
+                nx, ny = x + dx, y + dy
+
+                # in bounds
+                if not in_bounds(nx, ny, w, h):
+                    continue
+
+                # can only enter when tile becomes walkable
+                if d + 1 < walkable_at[(nx, ny)]:
+                    continue
+
+                # first time reached
+                if (nx, ny) not in dist:
+                    dist[(nx, ny)] = d + 1
+                    claimants[(nx, ny)].add(idx)
+                    next_frontier.append((nx, ny, idx))
+
+                # already reached at same min distance → tie
+                elif dist[(nx, ny)] == d + 1:
+                    claimants[(nx, ny)].add(idx)
+
+        # STOP when BFS adds no new tiles
+        if not next_frontier:
+            break
+
+        frontier = next_frontier
+        d += 1
+
+    # ---------------------------------------------------
+    # 4. Resolve tile ownership
+    # ---------------------------------------------------
+    lengths = {i: len(a["b"]) for i, a in enumerate(sn)}
+    area_count = defaultdict(int)
+
+    for cell, idxs in claimants.items():
+
+        # Only one snake reached → that snake owns
+        if len(idxs) == 1:
+            area_count[next(iter(idxs))] += 1
+            continue
+
+        # Multiple → bigger snake wins
+        mx = max(lengths[i] for i in idxs)
+        best = [i for i in idxs if lengths[i] == mx]
+
+        if len(best) == 1:
+            area_count[best[0]] += 1
+        # if multiple same length: ignore tile (contested)
+
+    my_area = area_count.get(yi, 0)
+
+    max_enemy_area = 0
+    for i, snake in enumerate(sn):
+        if i != yi and snake["alive"]:
+            max_enemy_area = max(max_enemy_area, area_count.get(i, 0))
+
+    return my_area, max_enemy_area
 
 def evaluate_state(s):
     """
@@ -277,7 +372,7 @@ def evaluate_state(s):
       * enemy area
       * our health
       * nearby food
-      * our length (slightly more important when low HP)
+      * length gained (current_len - start_len), weighted slightly more if HP low
     """
     sn = s["sn"]
     yi = s["yi"]
@@ -288,17 +383,12 @@ def evaluate_state(s):
         return -1e9
 
     # ---------- 1) Space control ----------
-    my_area = floodfill_area(s, yi)
-
-    max_enemy_area = 0
+    my_area, max_enemy_area = compute_areas(s)
     for i, a in enumerate(sn):
         if i == yi or not a["alive"]:
             continue
-        ea = floodfill_area(s, i)
-        if ea > max_enemy_area:
-            max_enemy_area = ea
 
-    # ---------- 2) Food proximity (same as before) ----------
+    # ---------- 2) Food proximity ----------
     head = me["b"][0]
     hx, hy = head
     food_bonus = 0
@@ -310,34 +400,33 @@ def evaluate_state(s):
             else:
                 food_bonus += max(0, 3 - dist)
 
-    # ---------- 3) Length term (slightly stronger when low HP) ----------
-    my_len = len(me["b"])
-    hp = me["hp"]
+    # ---------- 3) Length gained ----------
+    current_len = len(me["b"])
+    start_len   = s["init_len"]      # MUST be stored at root
+    hp          = me["hp"]
 
-    # base weight for length
     base_len_weight = 0.2
-    # when HP < 30, increase length weight up to +30% at HP = 0
-    if hp < 30:
-        low_hp_factor = 1.0 + 0.3 * (30 - hp) / 30.0   # ranges from 1.0 to 1.3
+
+    if hp < 20:
+        low_hp_factor = 1.0 + 0.3 * (30 - hp) / 30.0
     else:
         low_hp_factor = 1.0
 
     effective_len_weight = base_len_weight * low_hp_factor
-
+    length_gain = current_len - start_len
     # ---------- 4) Combine terms ----------
     space_weight   = 1.0
     control_weight = 0.5
-    health_weight  = 0.1
+    health_weight  = 0.01
     food_weight    = 0.1
 
     control_term = my_area - max_enemy_area
-
     score  = 0.0
     score += space_weight   * my_area
     score += control_weight * control_term
     score += health_weight  * hp
     score += food_weight    * food_bonus
-    score += effective_len_weight * my_len
+    score += effective_len_weight * length_gain  # NEW LENGTH LOGIC
 
     return score
 
@@ -415,6 +504,7 @@ def expand_decision_node(node):
     node["children"].append(child_game)
     return child_game
 
+
 def simulate_once(root, max_depth=D_DEFAULT):
     """Run one tree simulation starting from root GameNode.
     Uses random selection among children, expands nodes when needed,
@@ -479,6 +569,7 @@ def simulate_once(root, max_depth=D_DEFAULT):
                 if vals:
                     n["value"] = min(vals)
 
+
 def choose_move_minimax_tree_from_json(j, I=I_DEFAULT, max_depth=D_DEFAULT, debug=False):
     """Full minimax-style tree search with random rollouts for enemy moves."""
     s0 = s_from_json(j)
@@ -513,8 +604,9 @@ def battlesnake_move_response_minimax_tree(j_str, I=I_DEFAULT, max_depth=D_DEFAU
     mv = choose_move_minimax_tree_from_json(j_str, I=I, max_depth=max_depth)
     return {
         "move": mv,
-        "shout": f"",
+        "shout": "",
     }
+
 
 from flask import Flask, request, jsonify
 
