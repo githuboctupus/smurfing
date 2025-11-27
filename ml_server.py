@@ -296,11 +296,7 @@ def index():
         "version": "1.0.0"
     })
 
-
 @app.get("/ping")
-def ping():
-    return "ok"
-@app.post("/ping")
 def ping():
     return "ok"
 
