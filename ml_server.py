@@ -254,7 +254,7 @@ def build_obs(game_state):
 # Load model once at startup
 # ============================================================
 
-MODEL_PATH = os.environ.get("BATTLESNAKE_MODEL", "snake_model.pt")
+MODEL_PATH = os.environ.get("BATTLESNAKE_MODEL", "snake_update_00600_wr_0p340.pt")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 model = SnakePolicyNet(20, 256).to(DEVICE)
@@ -338,5 +338,3 @@ def end():
     print(f"[Battlesnake] Game ended: {game_id}")
     return "ok"
 
-port = int(os.environ.get("PORT", "8000"))
-app.run(host="0.0.0.0", port=port)
