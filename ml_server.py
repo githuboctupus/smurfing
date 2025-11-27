@@ -287,14 +287,14 @@ def index():
     """
     Battlesnake info + cosmetics.
     """
-    return jsonify({
+    return {
         "apiversion": "1",
         "author": "githuboctupus",     # TODO: update
         "color": "#00FF00",
         "head": "pixel",
         "tail": "pixel",
         "version": "1.0.0"
-    })
+    }
 
 @app.get("/ping")
 def ping():
@@ -336,6 +336,5 @@ def end():
     game_id = data["game"]["id"]
     print(f"[Battlesnake] Game ended: {game_id}")
     return "ok"
-port = int(os.environ.get("PORT", 8010))
-app.run(host="0.0.0.0", port=port)
+
 print("Succesful Launch")
