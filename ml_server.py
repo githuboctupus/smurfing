@@ -283,6 +283,7 @@ app = Flask(__name__)
 
 @app.get("/")
 def index():
+    print("index")
     """
     Battlesnake info + cosmetics.
     """
@@ -337,4 +338,4 @@ def end():
     game_id = data["game"]["id"]
     print(f"[Battlesnake] Game ended: {game_id}")
     return "ok"
-
+print("Succesful Launch")
