@@ -336,6 +336,6 @@ def end():
     game_id = data["game"]["id"]
     print(f"[Battlesnake] Game ended: {game_id}")
     return "ok"
-port = int(os.environ.get("PORT", 8000))
+port = int(os.environ.get("PORT", 8010))
 app.run(host="0.0.0.0", port=port)
 print("Succesful Launch")
