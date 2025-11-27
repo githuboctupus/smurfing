@@ -283,7 +283,7 @@ app = Flask(__name__)
 
 @app.get("/")
 def index():
-    print("index")
+    print("[DEBUG] HIT / route", flush=True)
     """
     Battlesnake info + cosmetics.
     """
@@ -297,10 +297,12 @@ def index():
     })
 
 
+@app.get("/ping")
+def ping():
+    return "ok"
 @app.post("/ping")
 def ping():
     return "ok"
-
 
 @app.post("/start")
 def start():
@@ -338,4 +340,6 @@ def end():
     game_id = data["game"]["id"]
     print(f"[Battlesnake] Game ended: {game_id}")
     return "ok"
+port = int(os.environ.get("PORT", 8000))
+app.run(host="0.0.0.0", port=port)
 print("Succesful Launch")
